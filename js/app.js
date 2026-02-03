@@ -2574,7 +2574,7 @@ class AppController {
             this.switchView(redirectView);
         } catch (error) {
             console.error('Profile creation error:', error);
-            this.showAlert('Failed to create profile', 'error');
+            this.showAlert(error?.message || 'Failed to create profile', 'error');
         } finally {
             this.showLoading(false);
         }

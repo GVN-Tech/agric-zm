@@ -155,30 +155,43 @@ class AuthManager {
 
     // Create or update user profile
     async createProfile(profileData) {
-        if (!this.currentUser?.id) {
+        let userId = this.currentUser?.id || null;
+        if (!userId) {
             const { data: { user } } = await this.supabase.auth.getUser();
-            if (!user) {
-                throw new Error('User not authenticated');
-            }
-            profileData.id = user.id;
-        } else {
-            profileData.id = this.currentUser.id;
+            userId = user?.id || null;
         }
 
-        const { data, error } = await this.supabase
+        if (!userId) {
+            throw new Error('User not authenticated');
+        }
+
+        const payload = { ...profileData, id: userId };
+
+        const { error: upsertError } = await this.supabase
             .from('profiles')
-            .upsert(profileData, { onConflict: 'id' })
-            .select()
-            .single();
+            .upsert(payload, { onConflict: 'id' });
 
-        if (error) {
-            console.error('Profile creation error:', error);
-            throw error;
+        if (upsertError) {
+            console.error('Profile creation error:', upsertError);
+            throw upsertError;
         }
 
-        this.currentProfile = data;
-        this.currentUser = { ...this.currentUser, ...data };
-        return data;
+        let data = null;
+        try {
+            const response = await this.supabase
+                .from('profiles')
+                .select('*')
+                .eq('id', userId)
+                .maybeSingle();
+            data = response?.data || null;
+        } catch (_) {
+            data = null;
+        }
+
+        const resolvedProfile = data || payload;
+        this.currentProfile = resolvedProfile;
+        this.currentUser = { ...(this.currentUser || { id: userId }), ...resolvedProfile };
+        return resolvedProfile;
     }
 
     // Sign out
