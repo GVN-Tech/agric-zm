@@ -52,6 +52,12 @@ class AppController {
             }
 
             // Initialize managers
+            if (!supabaseClient) {
+                console.warn('Supabase client failed to initialize - running in preview mode');
+                this.showPreviewMode();
+                this.switchView(requestedView || 'feed', false);
+                return;
+            }
             this.supabase = supabaseClient;
             this.authManager = new AuthManager(supabaseClient);
             this.postsManager = new PostsManager(supabaseClient);
