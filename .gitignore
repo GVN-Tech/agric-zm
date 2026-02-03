@@ -1,0 +1,19 @@
+# Environment variables
+.env
+.env.local
+.env.*.local
+config/env.js
+
+# Node.js dependencies
+node_modules/
+
+# Supabase config backups
+config/supabase-config.js.bak
+
+# IDE files
+.vscode/
+.idea/
+
+# Python
+__pycache__/
+*.pyc

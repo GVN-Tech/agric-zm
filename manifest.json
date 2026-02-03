@@ -1,0 +1,36 @@
+{
+  "name": "Agrilovers - Zambian Farmers Network",
+  "short_name": "Agrilovers",
+  "description": "Connect Zambian farmers, share knowledge, and access markets",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#1e3a5f",
+  "theme_color": "#1e3a5f",
+  "orientation": "portrait-primary",
+  "icons": [
+    {
+      "src": "icons/icon.svg",
+      "sizes": "72x72 96x96 128x128 144x144 152x152 192x192 384x384 512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["social", "agriculture", "business"],
+  "screenshots": [],
+  "shortcuts": [
+    {
+      "name": "Feed",
+      "short_name": "Feed",
+      "description": "View farmer posts",
+      "url": "/?view=feed",
+      "icons": [{ "src": "icons/icon.svg", "sizes": "96x96", "type": "image/svg+xml" }]
+    },
+    {
+      "name": "Market",
+      "short_name": "Market",
+      "description": "View market prices",
+      "url": "/?view=market",
+      "icons": [{ "src": "icons/icon.svg", "sizes": "96x96", "type": "image/svg+xml" }]
+    }
+  ]
+}
