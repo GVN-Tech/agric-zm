@@ -13,12 +13,14 @@ class AuthManager {
         // Check for existing session
         const { data: { session } } = await this.supabase.auth.getSession();
         if (session) {
+            this.currentUser = session.user || null;
             await this.loadUserProfile(session.user.id);
         }
 
         // Listen for auth changes
         this.supabase.auth.onAuthStateChange(async (event, session) => {
             if (event === 'SIGNED_IN' && session) {
+                this.currentUser = session.user || { id: session.user?.id };
                 await this.loadUserProfile(session.user.id);
                 this.onAuthChange(true);
             } else if (event === 'SIGNED_OUT') {
@@ -35,16 +37,20 @@ class AuthManager {
             .from('profiles')
             .select('*')
             .eq('id', userId)
-            .single();
+            .maybeSingle();
 
-        if (error && error.code !== 'PGRST116') { // PGRST116 = not found
+        if (error) {
             console.error('Error loading profile:', error);
             return null;
         }
 
+        if (!this.currentUser) {
+            this.currentUser = { id: userId };
+        }
+
         if (data) {
             this.currentProfile = data;
-            this.currentUser = { id: userId, ...data };
+            this.currentUser = { ...this.currentUser, id: userId, ...data };
             return data;
         }
 
@@ -59,6 +65,7 @@ class AuthManager {
                 [type]: emailOrPhone,
                 options: {
                     shouldCreateUser: true, // Auto-create user if doesn't exist
+                    emailRedirectTo: `${window.location.origin}/?view=feed`
                 }
             });
 
@@ -73,10 +80,11 @@ class AuthManager {
     // Verify OTP and sign in
     async verifyOTP(emailOrPhone, token, type = 'email') {
         try {
+            const otpType = type === 'phone' ? 'sms' : 'email';
             const { data, error } = await this.supabase.auth.verifyOtp({
                 [type]: emailOrPhone,
                 token: token,
-                type: 'email' // or 'sms'
+                type: otpType
             });
 
             if (error) throw error;
@@ -100,12 +108,16 @@ class AuthManager {
         try {
             const { data, error } = await this.supabase.auth.signUp({
                 email,
-                password
+                password,
+                options: {
+                    emailRedirectTo: `${window.location.origin}/?view=feed`
+                }
             });
 
             if (error) throw error;
 
             if (data?.session?.user) {
+                this.currentUser = data.session.user;
                 await this.loadUserProfile(data.session.user.id);
                 const hasProfile = !!this.currentProfile;
                 return { success: true, needsProfile: !hasProfile, user: data.session.user };
@@ -128,6 +140,7 @@ class AuthManager {
             if (error) throw error;
 
             if (data?.user) {
+                this.currentUser = data.user;
                 await this.loadUserProfile(data.user.id);
                 const hasProfile = !!this.currentProfile;
                 return { success: true, needsProfile: !hasProfile, user: data.user };

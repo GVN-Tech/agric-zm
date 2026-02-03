@@ -1,7 +1,7 @@
 // Service Worker for Agrilovers
 // Provides offline support and caching
 
-const CACHE_NAME = 'agrilovers-v4';
+const CACHE_NAME = 'agrilovers-v5';
 const STATIC_ASSETS = [
     '/',
     '/index.html',
@@ -16,7 +16,6 @@ const STATIC_ASSETS = [
     '/js/utils.js',
     '/js/toast.js',
     '/config/supabase-config.js',
-    '/config/env.js',
     '/manifest.json',
     '/icons/icon.svg'
 ];
