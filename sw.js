@@ -1,7 +1,7 @@
 // Service Worker for Agrilovers
 // Provides offline support and caching
 
-const CACHE_NAME = 'agrilovers-v5';
+const CACHE_NAME = 'agrilovers-v9';
 const STATIC_ASSETS = [
     '/',
     '/index.html',
@@ -37,7 +37,7 @@ self.addEventListener('install', (event) => {
 // Activate event - clean up old caches
 self.addEventListener('activate', (event) => {
     event.waitUntil(
-        caches.keys().then((cacheNames) => {
+        caches.keys().then((cacheNames) => { 
             return Promise.all(
                 cacheNames.map((cacheName) => {
                     if (cacheName !== CACHE_NAME) {

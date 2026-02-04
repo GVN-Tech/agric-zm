@@ -199,6 +199,89 @@ class PostsManager {
         }));
     }
 
+    async getPostById(postId) {
+        const id = String(postId || '').trim();
+        if (!id) return null;
+
+        const mapFromView = (row) => ({
+            id: row.id,
+            content: row.content,
+            crop_tags: row.crop_tags,
+            location_province: row.location_province,
+            location_district: row.location_district,
+            image_urls: row.image_urls,
+            is_market_post: row.is_market_post,
+            market_type: row.market_type,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            likes_count: row.likes_count,
+            comments_count: row.comments_count,
+            user_liked: row.user_liked,
+            author: {
+                id: row.author_id,
+                first_name: row.first_name,
+                last_name: row.last_name,
+                avatar_url: row.avatar_url,
+                province: row.author_province,
+                district: row.author_district,
+                farmer_type: row.farmer_type
+            }
+        });
+
+        const { data, error } = await this.supabase
+            .from('posts_with_stats')
+            .select('*')
+            .eq('id', id)
+            .single();
+
+        if (error && error.code === '42P01') {
+            return this.getPostByIdLegacy(id);
+        }
+
+        if (error) throw error;
+        if (!data) return null;
+        return mapFromView(data);
+    }
+
+    async getPostByIdLegacy(postId) {
+        const { data, error } = await this.supabase
+            .from('posts')
+            .select(`
+                *,
+                author:profiles!posts_author_id_fkey(id, first_name, last_name, avatar_url, province, district, farmer_type)
+            `)
+            .eq('id', postId)
+            .is('deleted_at', null)
+            .single();
+
+        if (error) throw error;
+        if (!data) return null;
+
+        const [likesRes, commentsRes, userRes] = await Promise.all([
+            this.supabase.from('post_likes').select('post_id').eq('post_id', postId),
+            this.supabase.from('comments').select('post_id').eq('post_id', postId).is('deleted_at', null),
+            this.supabase.auth.getUser()
+        ]);
+
+        const likesCount = Array.isArray(likesRes.data) ? likesRes.data.length : 0;
+        const commentsCount = Array.isArray(commentsRes.data) ? commentsRes.data.length : 0;
+
+        let userLiked = false;
+        if (userRes.data?.user?.id) {
+            const { data: userLikeRows } = await this.supabase
+                .from('post_likes')
+                .select('post_id')
+                .eq('user_id', userRes.data.user.id)
+                .eq('post_id', postId);
+            userLiked = Array.isArray(userLikeRows) && userLikeRows.length > 0;
+        }
+
+        data.likes_count = likesCount;
+        data.comments_count = commentsCount;
+        data.user_liked = userLiked;
+        return data;
+    }
+
     async getMarketPostsLegacy(options) {
         const {
             limit = 20,
@@ -420,7 +503,71 @@ class PostsManager {
             throw error;
         }
 
-        return data || [];
+        const comments = data || [];
+        if (!comments.length) return [];
+
+        const commentIds = comments.map((c) => c.id);
+
+        let viewerId = null;
+        try {
+            const { data: userRes } = await this.supabase.auth.getUser();
+            viewerId = userRes?.user?.id || null;
+        } catch (_) {
+            viewerId = null;
+        }
+
+        try {
+            const { data: likesData, error: likesError } = await this.supabase
+                .from('comment_likes')
+                .select('comment_id, user_id')
+                .in('comment_id', commentIds);
+            if (likesError) throw likesError;
+
+            const countMap = new Map();
+            const likedSet = new Set();
+            (likesData || []).forEach((row) => {
+                countMap.set(row.comment_id, (countMap.get(row.comment_id) || 0) + 1);
+                if (viewerId && row.user_id === viewerId) likedSet.add(row.comment_id);
+            });
+
+            comments.forEach((c) => {
+                c.likes_count = countMap.get(c.id) || 0;
+                c.user_liked = likedSet.has(c.id);
+            });
+        } catch (_) {
+            comments.forEach((c) => {
+                c.likes_count = c.likes_count || 0;
+                c.user_liked = !!c.user_liked;
+            });
+        }
+
+        return comments;
+    }
+
+    async likeComment(commentId) {
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const { error } = await this.supabase
+            .from('comment_likes')
+            .insert({ comment_id: commentId, user_id: user.id });
+
+        if (error) throw error;
+        return { success: true };
+    }
+
+    async unlikeComment(commentId) {
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const { error } = await this.supabase
+            .from('comment_likes')
+            .delete()
+            .eq('comment_id', commentId)
+            .eq('user_id', user.id);
+
+        if (error) throw error;
+        return { success: true };
     }
 
     // Delete a post (soft delete)
@@ -441,20 +588,38 @@ class PostsManager {
     // Upload images to Supabase Storage
     async uploadImages(files, userId) {
         if (!files || files.length === 0) return [];
-        
+
+        const allowedTypes = new Map([
+            ['image/jpeg', 'jpg'],
+            ['image/jpg', 'jpg'],
+            ['image/png', 'png'],
+            ['image/webp', 'webp'],
+            ['image/gif', 'gif']
+        ]);
+
+        const inputFiles = Array.from(files || []);
+        const selected = inputFiles
+            .filter((file) => file && typeof file.type === 'string' && file.type.startsWith('image/'))
+            .filter((file) => file.size <= 5 * 1024 * 1024)
+            .slice(0, 4);
+
         const imageUrls = [];
         
-        for (let i = 0; i < files.length; i++) {
-            const file = files[i];
-            const fileExt = file.name.split('.').pop();
-            const fileName = `${userId}/${Date.now()}_${Math.random().toString(36).substr(2, 9)}.${fileExt}`;
+        for (let i = 0; i < selected.length; i++) {
+            const file = selected[i];
+            const fileExt = allowedTypes.get(file.type) || null;
+            if (!fileExt) continue;
+
+            const token = Math.random().toString(36).slice(2, 10);
+            const fileName = `${userId}/${Date.now()}_${token}.${fileExt}`;
             
             try {
                 const { data, error } = await this.supabase.storage
                     .from('post-images')
                     .upload(fileName, file, {
                         cacheControl: '3600',
-                        upsert: false
+                        upsert: false,
+                        contentType: file.type
                     });
                     
                 if (error) {
@@ -533,6 +698,126 @@ class PostsManager {
             .from('profiles')
             .select('id, first_name, last_name, avatar_url, province, district, farmer_type, crops, livestock, farm_size_ha, bio, is_verified, created_at')
             .eq('id', farmerId)
+            .single();
+
+        if (error) throw error;
+        return data;
+    }
+
+    async getFriendStatus(otherUserId) {
+        const otherId = String(otherUserId || '').trim();
+        if (!otherId) return { status: 'none' };
+
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) return { status: 'none' };
+        if (user.id === otherId) return { status: 'self' };
+
+        try {
+            const { data: friendship, error: friendshipError } = await this.supabase
+                .from('friendships')
+                .select('id')
+                .eq('user_id', user.id)
+                .eq('friend_id', otherId)
+                .maybeSingle();
+
+            if (friendshipError) throw friendshipError;
+            if (friendship) return { status: 'friends' };
+        } catch (error) {
+            if (error?.code === '42P01') return { status: 'unavailable' };
+            throw error;
+        }
+
+        try {
+            const { data: request, error: requestError } = await this.supabase
+                .from('friend_requests')
+                .select('id, requester_id, receiver_id, status')
+                .eq('status', 'pending')
+                .or(`and(requester_id.eq.${user.id},receiver_id.eq.${otherId}),and(requester_id.eq.${otherId},receiver_id.eq.${user.id})`)
+                .maybeSingle();
+
+            if (requestError) throw requestError;
+            if (!request) return { status: 'none' };
+
+            if (request.requester_id === user.id) {
+                return { status: 'outgoing', requestId: request.id };
+            }
+            return { status: 'incoming', requestId: request.id };
+        } catch (error) {
+            if (error?.code === '42P01') return { status: 'unavailable' };
+            throw error;
+        }
+    }
+
+    async sendFriendRequest(receiverId) {
+        const receiver = String(receiverId || '').trim();
+        if (!receiver) throw new Error('Missing receiver');
+
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+        if (user.id === receiver) throw new Error('Cannot friend yourself');
+
+        const payload = { requester_id: user.id, receiver_id: receiver, status: 'pending' };
+
+        const { data, error } = await this.supabase
+            .from('friend_requests')
+            .insert(payload)
+            .select('id, requester_id, receiver_id, status')
+            .single();
+
+        if (error) {
+            if (error.code === '23505') {
+                const { data: existing, error: existingError } = await this.supabase
+                    .from('friend_requests')
+                    .select('id, requester_id, receiver_id, status')
+                    .eq('requester_id', user.id)
+                    .eq('receiver_id', receiver)
+                    .eq('status', 'pending')
+                    .maybeSingle();
+                if (existingError) throw existingError;
+                if (existing) return existing;
+            }
+            throw error;
+        }
+
+        return data;
+    }
+
+    async cancelFriendRequest(receiverId) {
+        const receiver = String(receiverId || '').trim();
+        if (!receiver) throw new Error('Missing receiver');
+
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const { data, error } = await this.supabase
+            .from('friend_requests')
+            .update({ status: 'canceled', responded_at: new Date().toISOString() })
+            .eq('requester_id', user.id)
+            .eq('receiver_id', receiver)
+            .eq('status', 'pending')
+            .select('id, status')
+            .maybeSingle();
+
+        if (error) throw error;
+        return data;
+    }
+
+    async respondToFriendRequest(requestId, decision) {
+        const id = String(requestId || '').trim();
+        const next = String(decision || '').trim().toLowerCase();
+        const status = next === 'accepted' ? 'accepted' : 'declined';
+        if (!id) throw new Error('Missing request');
+
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const { data, error } = await this.supabase
+            .from('friend_requests')
+            .update({ status, responded_at: new Date().toISOString() })
+            .eq('id', id)
+            .eq('receiver_id', user.id)
+            .eq('status', 'pending')
+            .select('id, status, requester_id, receiver_id')
             .single();
 
         if (error) throw error;

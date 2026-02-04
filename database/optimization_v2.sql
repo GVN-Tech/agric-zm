@@ -25,12 +25,17 @@ SELECT
     (SELECT COUNT(*)::int FROM public.group_members gm WHERE gm.group_id = g.id) as members_count,
     
     -- Current user membership (requires auth.uid())
-    (SELECT role FROM public.group_members gm WHERE gm.group_id = g.id AND gm.user_id = auth.uid()) as user_role
+    (SELECT role FROM public.group_members gm WHERE gm.group_id = g.id AND gm.user_id = auth.uid()) as user_role,
+
+    gjr.status as join_request_status,
+    gjr.id as join_request_id
 
 FROM 
     public.groups g
 JOIN 
-    public.profiles pr ON g.created_by = pr.id;
+    public.profiles pr ON g.created_by = pr.id
+LEFT JOIN
+    public.group_join_requests gjr ON gjr.group_id = g.id AND gjr.user_id = auth.uid();
 
 -- Grant access
 GRANT SELECT ON public.groups_with_stats TO anon, authenticated, service_role;

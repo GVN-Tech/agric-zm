@@ -7,6 +7,106 @@ class MessagingManager {
         this.channels = new Map();
     }
 
+    async hydrateChatPreviews(chats) {
+        const items = Array.isArray(chats) ? chats : [];
+        if (!items.length) return items;
+
+        const chatIds = items.map((c) => c && c.id).filter(Boolean);
+        if (!chatIds.length) return items;
+
+        const limit = Math.min(Math.max(chatIds.length * 6, 30), 250);
+
+        try {
+            const { data, error } = await this.supabase
+                .from('messages')
+                .select('chat_id, sender_id, content, created_at')
+                .in('chat_id', chatIds)
+                .order('created_at', { ascending: false })
+                .limit(limit);
+
+            if (error) throw error;
+
+            const previewByChat = new Map();
+            (data || []).forEach((row) => {
+                if (!row?.chat_id) return;
+                if (previewByChat.has(row.chat_id)) return;
+                previewByChat.set(row.chat_id, row);
+            });
+
+            items.forEach((chat) => {
+                const row = previewByChat.get(chat.id);
+                if (!row) {
+                    chat.last_message_preview = chat.last_message_preview || '';
+                    chat.last_message_sender_id = chat.last_message_sender_id || null;
+                    chat.last_message_created_at = chat.last_message_created_at || null;
+                    return;
+                }
+                chat.last_message_preview = row.content || '';
+                chat.last_message_sender_id = row.sender_id || null;
+                chat.last_message_created_at = row.created_at || null;
+            });
+
+            return items;
+        } catch (_) {
+            items.forEach((chat) => {
+                chat.last_message_preview = chat.last_message_preview || '';
+                chat.last_message_sender_id = chat.last_message_sender_id || null;
+                chat.last_message_created_at = chat.last_message_created_at || null;
+            });
+            return items;
+        }
+    }
+
+    async hydrateGroupPreviews(groups) {
+        const items = Array.isArray(groups) ? groups : [];
+        if (!items.length) return items;
+
+        const groupIds = items.map((g) => g && g.id).filter(Boolean);
+        if (!groupIds.length) return items;
+
+        const limit = Math.min(Math.max(groupIds.length * 6, 30), 250);
+
+        try {
+            const { data, error } = await this.supabase
+                .from('group_messages')
+                .select('group_id, sender_id, content, created_at')
+                .in('group_id', groupIds)
+                .order('created_at', { ascending: false })
+                .limit(limit);
+
+            if (error) throw error;
+
+            const previewByGroup = new Map();
+            (data || []).forEach((row) => {
+                if (!row?.group_id) return;
+                if (previewByGroup.has(row.group_id)) return;
+                previewByGroup.set(row.group_id, row);
+            });
+
+            items.forEach((group) => {
+                const row = previewByGroup.get(group.id);
+                if (!row) {
+                    group.last_message_preview = group.last_message_preview || '';
+                    group.last_message_sender_id = group.last_message_sender_id || null;
+                    group.last_message_created_at = group.last_message_created_at || null;
+                    return;
+                }
+                group.last_message_preview = row.content || '';
+                group.last_message_sender_id = row.sender_id || null;
+                group.last_message_created_at = row.created_at || null;
+            });
+
+            return items;
+        } catch (_) {
+            items.forEach((group) => {
+                group.last_message_preview = group.last_message_preview || '';
+                group.last_message_sender_id = group.last_message_sender_id || null;
+                group.last_message_created_at = group.last_message_created_at || null;
+            });
+            return items;
+        }
+    }
+
     // Get or create a chat between two users
     async getOrCreateChat(otherUserId) {
         const { data: { user } } = await this.supabase.auth.getUser();
@@ -72,7 +172,7 @@ class MessagingManager {
         if (!data || data.length === 0) return [];
 
         // Map view data to UI format
-        return data.map(row => {
+        const chats = data.map(row => {
             const isUser1 = row.user1_id === user.id;
             return {
                 id: row.id,
@@ -89,6 +189,7 @@ class MessagingManager {
                 }
             };
         });
+        return await this.hydrateChatPreviews(chats);
     }
 
     // Legacy method for backward compatibility
@@ -128,7 +229,54 @@ class MessagingManager {
             });
         }
 
-        return data || [];
+        return await this.hydrateChatPreviews(data || []);
+    }
+
+    async getGroupChats() {
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const { data, error } = await this.supabase
+            .from('group_members')
+            .select(`
+                role,
+                joined_at,
+                group:groups(
+                    id,
+                    name,
+                    description,
+                    group_type,
+                    crop_tag,
+                    province,
+                    is_public
+                )
+            `)
+            .eq('user_id', user.id)
+            .order('joined_at', { ascending: false });
+
+        if (error) {
+            console.error('Group chats fetch error:', error);
+            throw error;
+        }
+
+        const groups = (data || [])
+            .map((row) => {
+                const group = row.group || null;
+                if (!group?.id) return null;
+                return {
+                    id: group.id,
+                    name: group.name,
+                    description: group.description,
+                    group_type: group.group_type,
+                    crop_tag: group.crop_tag,
+                    province: group.province,
+                    is_public: group.is_public,
+                    user_role: row.role
+                };
+            })
+            .filter(Boolean);
+
+        return await this.hydrateGroupPreviews(groups);
     }
 
     // Get messages for a chat
@@ -137,7 +285,8 @@ class MessagingManager {
             .from('messages')
             .select(`
                 *,
-                sender:profiles!messages_sender_id_fkey(id, first_name, last_name, avatar_url)
+                sender:profiles!messages_sender_id_fkey(id, first_name, last_name, avatar_url),
+                attachments:message_attachments(*)
             `)
             .eq('chat_id', chatId)
             .order('created_at', { ascending: false })
@@ -151,8 +300,28 @@ class MessagingManager {
         return (data || []).reverse(); // Reverse to show oldest first
     }
 
+    async getGroupMessages(groupId, limit = 50) {
+        const { data, error } = await this.supabase
+            .from('group_messages')
+            .select(`
+                *,
+                sender:profiles!group_messages_sender_id_fkey(id, first_name, last_name, avatar_url),
+                attachments:message_attachments(*)
+            `)
+            .eq('group_id', groupId)
+            .order('created_at', { ascending: false })
+            .limit(limit);
+
+        if (error) {
+            console.error('Group messages fetch error:', error);
+            throw error;
+        }
+
+        return (data || []).reverse();
+    }
+
     // Send a message
-    async sendMessage(chatId, content) {
+    async sendMessage(chatId, content, files = []) {
         const { data: { user } } = await this.supabase.auth.getUser();
         if (!user) throw new Error('User must be authenticated');
 
@@ -164,22 +333,67 @@ class MessagingManager {
             throw new Error('Cannot send message: User is blocked');
         }
 
+        const body = content && content.trim() ? content.trim() : (files && files.length ? 'Attachment' : '');
+        if (!body) throw new Error('Message cannot be empty');
+
+        const payload = {
+            chat_id: chatId,
+            sender_id: user.id,
+            content: body
+        };
+
         const { data, error } = await this.supabase
             .from('messages')
-            .insert({
-                chat_id: chatId,
-                sender_id: user.id,
-                content: content.trim()
-            })
+            .insert(payload)
             .select(`
                 *,
-                sender:profiles!messages_sender_id_fkey(id, first_name, last_name, avatar_url)
+                sender:profiles!messages_sender_id_fkey(id, first_name, last_name, avatar_url),
+                attachments:message_attachments(*)
             `)
             .single();
 
         if (error) {
             console.error('Message send error:', error);
             throw error;
+        }
+
+        const attachments = await this.uploadMessageAttachments(files, user.id, { messageId: data.id });
+        if (attachments.length) {
+            data.attachments = attachments;
+        }
+
+        return data;
+    }
+
+    async sendGroupMessage(groupId, content, files = []) {
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const body = content && content.trim() ? content.trim() : (files && files.length ? 'Attachment' : '');
+        if (!body) throw new Error('Message cannot be empty');
+
+        const { data, error } = await this.supabase
+            .from('group_messages')
+            .insert({
+                group_id: groupId,
+                sender_id: user.id,
+                content: body
+            })
+            .select(`
+                *,
+                sender:profiles!group_messages_sender_id_fkey(id, first_name, last_name, avatar_url),
+                attachments:message_attachments(*)
+            `)
+            .single();
+
+        if (error) {
+            console.error('Group message send error:', error);
+            throw error;
+        }
+
+        const attachments = await this.uploadMessageAttachments(files, user.id, { groupMessageId: data.id });
+        if (attachments.length) {
+            data.attachments = attachments;
         }
 
         return data;
@@ -238,7 +452,8 @@ class MessagingManager {
                         .from('messages')
                         .select(`
                             *,
-                            sender:profiles!messages_sender_id_fkey(id, first_name, last_name, avatar_url)
+                            sender:profiles!messages_sender_id_fkey(id, first_name, last_name, avatar_url),
+                            attachments:message_attachments(*)
                         `)
                         .eq('id', payload.new.id)
                         .single();
@@ -248,17 +463,119 @@ class MessagingManager {
             )
             .subscribe();
 
-        this.channels.set(chatId, channel);
+        this.channels.set(`chat:${chatId}`, channel);
         return channel;
     }
 
     // Unsubscribe from chat
     unsubscribeFromMessages(chatId) {
-        const channel = this.channels.get(chatId);
+        const channel = this.channels.get(`chat:${chatId}`);
         if (channel) {
             this.supabase.removeChannel(channel);
-            this.channels.delete(chatId);
+            this.channels.delete(`chat:${chatId}`);
         }
+    }
+
+    subscribeToGroupMessages(groupId, callback) {
+        const channel = this.supabase
+            .channel(`group:${groupId}`)
+            .on('postgres_changes',
+                {
+                    event: 'INSERT',
+                    schema: 'public',
+                    table: 'group_messages',
+                    filter: `group_id=eq.${groupId}`
+                },
+                async (payload) => {
+                    const { data } = await this.supabase
+                        .from('group_messages')
+                        .select(`
+                            *,
+                            sender:profiles!group_messages_sender_id_fkey(id, first_name, last_name, avatar_url),
+                            attachments:message_attachments(*)
+                        `)
+                        .eq('id', payload.new.id)
+                        .single();
+
+                    callback(data);
+                }
+            )
+            .subscribe();
+
+        this.channels.set(`group:${groupId}`, channel);
+        return channel;
+    }
+
+    unsubscribeFromGroupMessages(groupId) {
+        const channel = this.channels.get(`group:${groupId}`);
+        if (channel) {
+            this.supabase.removeChannel(channel);
+            this.channels.delete(`group:${groupId}`);
+        }
+    }
+
+    async uploadMessageAttachments(files, userId, options = {}) {
+        const items = Array.from(files || []).filter(Boolean);
+        if (!items.length) return [];
+
+        const maxSize = 10 * 1024 * 1024;
+        const allowedFiles = items.filter((file) => file.size <= maxSize);
+
+        const attachments = [];
+
+        for (let i = 0; i < allowedFiles.length; i++) {
+            const file = allowedFiles[i];
+            const token = Math.random().toString(36).slice(2, 10);
+            const cleanName = String(file.name || 'file').replace(/[^\w.\-]+/g, '_');
+            const filePath = `${userId}/${Date.now()}_${token}_${cleanName}`;
+            const contentType = file.type || 'application/octet-stream';
+
+            try {
+                const { error } = await this.supabase.storage
+                    .from('message-attachments')
+                    .upload(filePath, file, {
+                        cacheControl: '3600',
+                        upsert: false,
+                        contentType
+                    });
+
+                if (error) {
+                    console.error('Attachment upload error:', error);
+                    continue;
+                }
+
+                const { data: { publicUrl } } = this.supabase.storage
+                    .from('message-attachments')
+                    .getPublicUrl(filePath);
+
+                const attachmentRow = {
+                    file_url: publicUrl,
+                    file_name: file.name || cleanName,
+                    file_type: contentType,
+                    file_size: file.size || null
+                };
+
+                if (options.messageId) attachmentRow.message_id = options.messageId;
+                if (options.groupMessageId) attachmentRow.group_message_id = options.groupMessageId;
+
+                const { data: stored, error: insertError } = await this.supabase
+                    .from('message_attachments')
+                    .insert(attachmentRow)
+                    .select('*')
+                    .single();
+
+                if (insertError) {
+                    console.error('Attachment record error:', insertError);
+                    continue;
+                }
+
+                attachments.push(stored);
+            } catch (error) {
+                console.error('Attachment upload failed:', error);
+            }
+        }
+
+        return attachments;
     }
 
     // Block a user
@@ -341,5 +658,3 @@ class MessagingManager {
 if (typeof window !== 'undefined') {
     window.MessagingManager = MessagingManager;
 }
-
-

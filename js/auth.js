@@ -6,29 +6,63 @@ class AuthManager {
         this.supabase = supabase;
         this.currentUser = null;
         this.currentProfile = null;
+        this.authReady = null;
+        this.authReadyResolver = null;
+        this.sessionStorageKey = 'agrilovers.supabase.session';
     }
 
     // Initialize auth state listener
     async init() {
-        // Check for existing session
+        if (!this.authReady) {
+            this.authReady = new Promise((resolve) => {
+                this.authReadyResolver = resolve;
+            });
+        }
+
+        const resolveReady = () => {
+            if (this.authReadyResolver) {
+                const resolver = this.authReadyResolver;
+                this.authReadyResolver = null;
+                resolver();
+            }
+        };
+
+        await this.restoreSessionFromStorage();
         const { data: { session } } = await this.supabase.auth.getSession();
         if (session) {
             this.currentUser = session.user || null;
             await this.loadUserProfile(session.user.id);
+            resolveReady();
         }
 
-        // Listen for auth changes
         this.supabase.auth.onAuthStateChange(async (event, session) => {
-            if (event === 'SIGNED_IN' && session) {
+            resolveReady();
+            const isSignedInEvent = event === 'SIGNED_IN' || event === 'INITIAL_SESSION' || event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED';
+            if (isSignedInEvent && session) {
+                this.storeSession(session);
                 this.currentUser = session.user || { id: session.user?.id };
                 await this.loadUserProfile(session.user.id);
                 this.onAuthChange(true);
-            } else if (event === 'SIGNED_OUT') {
+                return;
+            }
+            if (event === 'SIGNED_OUT') {
+                this.clearStoredSession();
                 this.currentUser = null;
                 this.currentProfile = null;
                 this.onAuthChange(false);
             }
         });
+    }
+
+    async waitForAuthReady(timeoutMs = 2000) {
+        if (!this.authReady) return;
+        if (!timeoutMs || timeoutMs <= 0) {
+            return this.authReady;
+        }
+        return Promise.race([
+            this.authReady,
+            new Promise((resolve) => window.setTimeout(resolve, timeoutMs))
+        ]);
     }
 
     // Load user profile from database
@@ -88,6 +122,7 @@ class AuthManager {
             });
 
             if (error) throw error;
+            if (data?.session) this.storeSession(data.session);
 
             // Check if profile exists, if not, redirect to profile creation
             const profile = await this.loadUserProfile(data.user.id);
@@ -117,6 +152,7 @@ class AuthManager {
             if (error) throw error;
 
             if (data?.session?.user) {
+                if (data.session) this.storeSession(data.session);
                 this.currentUser = data.session.user;
                 await this.loadUserProfile(data.session.user.id);
                 const hasProfile = !!this.currentProfile;
@@ -140,6 +176,7 @@ class AuthManager {
             if (error) throw error;
 
             if (data?.user) {
+                if (data.session) this.storeSession(data.session);
                 this.currentUser = data.user;
                 await this.loadUserProfile(data.user.id);
                 const hasProfile = !!this.currentProfile;
@@ -201,9 +238,62 @@ class AuthManager {
             console.error('Sign out error:', error);
             return { success: false, error: error.message };
         }
+        this.clearStoredSession();
         this.currentUser = null;
         this.currentProfile = null;
         return { success: true };
+    }
+
+    storeSession(session) {
+        const accessToken = session?.access_token || '';
+        const refreshToken = session?.refresh_token || '';
+        if (!accessToken || !refreshToken) return;
+        try {
+            const payload = { access_token: accessToken, refresh_token: refreshToken };
+            window.localStorage.setItem(this.sessionStorageKey, JSON.stringify(payload));
+        } catch (_) {
+        }
+    }
+
+    clearStoredSession() {
+        try {
+            window.localStorage.removeItem(this.sessionStorageKey);
+        } catch (_) {
+        }
+    }
+
+    async restoreSessionFromStorage() {
+        let raw = null;
+        try {
+            raw = window.localStorage.getItem(this.sessionStorageKey);
+        } catch (_) {
+            raw = null;
+        }
+        if (!raw) return;
+        let parsed = null;
+        try {
+            parsed = JSON.parse(raw);
+        } catch (_) {
+            this.clearStoredSession();
+            return;
+        }
+        const accessToken = parsed?.access_token || '';
+        const refreshToken = parsed?.refresh_token || '';
+        if (!accessToken || !refreshToken) {
+            this.clearStoredSession();
+            return;
+        }
+        try {
+            const { data: { session }, error } = await this.supabase.auth.setSession({
+                access_token: accessToken,
+                refresh_token: refreshToken
+            });
+            if (error || !session) {
+                this.clearStoredSession();
+            }
+        } catch (_) {
+            this.clearStoredSession();
+        }
     }
 
     // Get current user

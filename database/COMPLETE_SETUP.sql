@@ -178,6 +178,22 @@ CREATE TABLE public.group_members (
 CREATE INDEX idx_group_members_group ON public.group_members(group_id);
 CREATE INDEX idx_group_members_user ON public.group_members(user_id);
 
+CREATE TABLE public.group_join_requests (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    group_id UUID NOT NULL REFERENCES public.groups(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    status TEXT CHECK (status IN ('pending', 'approved', 'rejected')) DEFAULT 'pending',
+    requested_at TIMESTAMPTZ DEFAULT NOW(),
+    decided_at TIMESTAMPTZ,
+    decided_by UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    UNIQUE(group_id, user_id)
+);
+
+CREATE INDEX idx_group_join_requests_group ON public.group_join_requests(group_id);
+CREATE INDEX idx_group_join_requests_user ON public.group_join_requests(user_id);
+CREATE INDEX idx_group_join_requests_status ON public.group_join_requests(status);
+CREATE INDEX idx_group_join_requests_requested_at ON public.group_join_requests(requested_at DESC);
+
 -- ============================================
 -- CHATS TABLE (1-to-1 conversations)
 -- ============================================
@@ -209,6 +225,24 @@ CREATE TABLE public.messages (
 
 CREATE INDEX idx_messages_chat ON public.messages(chat_id);
 CREATE INDEX idx_messages_created_at ON public.messages(created_at);
+
+-- ============================================
+-- NOTIFICATIONS TABLE
+-- ============================================
+CREATE TABLE public.notifications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    recipient_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    actor_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    type TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT,
+    data JSONB DEFAULT '{}'::jsonb,
+    is_read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX idx_notifications_recipient_created_at ON public.notifications(recipient_id, created_at DESC);
+CREATE INDEX idx_notifications_recipient_is_read ON public.notifications(recipient_id, is_read);
 
 -- ============================================
 -- ROW LEVEL SECURITY POLICIES
@@ -287,9 +321,10 @@ ALTER TABLE public.groups ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "Public groups are viewable by everyone"
     ON public.groups FOR SELECT
-    USING (is_public = TRUE OR EXISTS (
-        SELECT 1 FROM public.group_members WHERE group_id = id AND user_id = auth.uid()
-    ));
+    USING (
+        is_public = TRUE
+        OR auth.role() = 'authenticated'
+    );
 
 CREATE POLICY "Auth users can create groups"
     ON public.groups FOR INSERT
@@ -304,13 +339,127 @@ CREATE POLICY "Group members viewable by group members"
         SELECT 1 FROM public.groups g WHERE g.id = group_id AND (g.is_public = TRUE OR g.created_by = auth.uid())
     ) OR user_id = auth.uid());
 
-CREATE POLICY "Users can join public groups"
+DROP POLICY IF EXISTS "Users can join public groups" ON public.group_members;
+CREATE POLICY "Users can insert group memberships"
     ON public.group_members FOR INSERT
-    WITH CHECK (auth.uid() = user_id);
+    WITH CHECK (
+        (
+            auth.uid() = user_id
+            AND EXISTS (
+                SELECT 1 FROM public.groups g
+                WHERE g.id = group_id
+                AND g.is_public = TRUE
+            )
+        )
+        OR EXISTS (
+            SELECT 1 FROM public.groups g
+            WHERE g.id = group_id
+            AND g.created_by = auth.uid()
+        )
+        OR EXISTS (
+            SELECT 1 FROM public.group_members gm
+            WHERE gm.group_id = group_id
+            AND gm.user_id = auth.uid()
+            AND gm.role IN ('admin', 'moderator')
+        )
+    );
+
+ALTER TABLE public.group_join_requests ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can request to join private groups"
+    ON public.group_join_requests FOR INSERT
+    WITH CHECK (
+        auth.uid() = user_id
+        AND EXISTS (
+            SELECT 1 FROM public.groups g
+            WHERE g.id = group_id
+            AND g.is_public = FALSE
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM public.group_members gm
+            WHERE gm.group_id = group_id
+            AND gm.user_id = auth.uid()
+        )
+        AND status = 'pending'
+        AND decided_by IS NULL
+        AND decided_at IS NULL
+    );
+
+CREATE POLICY "Users and admins can view join requests"
+    ON public.group_join_requests FOR SELECT
+    USING (
+        user_id = auth.uid()
+        OR EXISTS (
+            SELECT 1 FROM public.groups g
+            WHERE g.id = group_id
+            AND (
+                g.created_by = auth.uid()
+                OR EXISTS (
+                    SELECT 1 FROM public.group_members gm
+                    WHERE gm.group_id = group_id
+                    AND gm.user_id = auth.uid()
+                    AND gm.role IN ('admin', 'moderator')
+                )
+            )
+        )
+    );
+
+CREATE POLICY "Admins can decide join requests"
+    ON public.group_join_requests FOR UPDATE
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.groups g
+            WHERE g.id = group_id
+            AND (
+                g.created_by = auth.uid()
+                OR EXISTS (
+                    SELECT 1 FROM public.group_members gm
+                    WHERE gm.group_id = group_id
+                    AND gm.user_id = auth.uid()
+                    AND gm.role IN ('admin', 'moderator')
+                )
+            )
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM public.groups g
+            WHERE g.id = group_id
+            AND (
+                g.created_by = auth.uid()
+                OR EXISTS (
+                    SELECT 1 FROM public.group_members gm
+                    WHERE gm.group_id = group_id
+                    AND gm.user_id = auth.uid()
+                    AND gm.role IN ('admin', 'moderator')
+                )
+            )
+        )
+        AND decided_by = auth.uid()
+        AND (
+            (status = 'pending' AND decided_at IS NULL)
+            OR (status IN ('approved', 'rejected') AND decided_at IS NOT NULL)
+        )
+    );
+
+CREATE POLICY "Users can retry rejected join requests"
+    ON public.group_join_requests FOR UPDATE
+    USING (user_id = auth.uid() AND status = 'rejected')
+    WITH CHECK (
+        user_id = auth.uid()
+        AND status = 'pending'
+        AND decided_by IS NULL
+        AND decided_at IS NULL
+    );
+
+CREATE POLICY "Users can cancel pending join requests"
+    ON public.group_join_requests FOR DELETE
+    USING (user_id = auth.uid() AND status = 'pending');
 
 -- CHATS & MESSAGES
 ALTER TABLE public.chats ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "Users can view their own chats"
     ON public.chats FOR SELECT
@@ -318,6 +467,11 @@ CREATE POLICY "Users can view their own chats"
 
 CREATE POLICY "Users can create chats"
     ON public.chats FOR INSERT
+    WITH CHECK (auth.uid() = user1_id OR auth.uid() = user2_id);
+
+CREATE POLICY "Users can update own chats"
+    ON public.chats FOR UPDATE
+    USING (auth.uid() = user1_id OR auth.uid() = user2_id)
     WITH CHECK (auth.uid() = user1_id OR auth.uid() = user2_id);
 
 CREATE POLICY "Users can view messages in their chats"
@@ -328,7 +482,341 @@ CREATE POLICY "Users can view messages in their chats"
 
 CREATE POLICY "Users can send messages to their chats"
     ON public.messages FOR INSERT
-    WITH CHECK (auth.uid() = sender_id);
+    WITH CHECK (
+        auth.uid() = sender_id
+        AND EXISTS (
+            SELECT 1 FROM public.chats c
+            WHERE c.id = chat_id
+            AND (c.user1_id = auth.uid() OR c.user2_id = auth.uid())
+        )
+    );
+
+CREATE POLICY "Users can mark messages as read"
+    ON public.messages FOR UPDATE
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.chats c
+            WHERE c.id = chat_id
+            AND (c.user1_id = auth.uid() OR c.user2_id = auth.uid())
+        )
+        AND sender_id <> auth.uid()
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM public.chats c
+            WHERE c.id = chat_id
+            AND (c.user1_id = auth.uid() OR c.user2_id = auth.uid())
+        )
+        AND sender_id <> auth.uid()
+    );
+
+CREATE POLICY "Users can view own notifications"
+    ON public.notifications FOR SELECT
+    USING (recipient_id = auth.uid());
+
+CREATE POLICY "Users can mark own notifications as read"
+    ON public.notifications FOR UPDATE
+    USING (recipient_id = auth.uid())
+    WITH CHECK (recipient_id = auth.uid());
+
+REVOKE UPDATE ON public.chats FROM anon, authenticated;
+GRANT UPDATE(last_message_at) ON public.chats TO authenticated;
+
+REVOKE UPDATE ON public.messages FROM anon, authenticated;
+GRANT UPDATE(is_read) ON public.messages TO authenticated;
+
+REVOKE UPDATE ON public.notifications FROM anon, authenticated;
+GRANT UPDATE(is_read) ON public.notifications TO authenticated;
+
+-- ============================================
+-- FUNCTIONS & TRIGGERS
+-- ============================================
+
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS update_profiles_updated_at ON public.profiles;
+CREATE TRIGGER update_profiles_updated_at BEFORE UPDATE ON public.profiles
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_posts_updated_at ON public.posts;
+CREATE TRIGGER update_posts_updated_at BEFORE UPDATE ON public.posts
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_comments_updated_at ON public.comments;
+CREATE TRIGGER update_comments_updated_at BEFORE UPDATE ON public.comments
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+DROP TRIGGER IF EXISTS update_groups_updated_at ON public.groups;
+CREATE TRIGGER update_groups_updated_at BEFORE UPDATE ON public.groups
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE OR REPLACE FUNCTION update_chat_last_message()
+RETURNS TRIGGER AS $$
+BEGIN
+    UPDATE public.chats
+    SET last_message_at = NEW.created_at
+    WHERE id = NEW.chat_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS update_chat_timestamp ON public.messages;
+CREATE TRIGGER update_chat_timestamp AFTER INSERT ON public.messages
+    FOR EACH ROW EXECUTE FUNCTION update_chat_last_message();
+
+CREATE OR REPLACE FUNCTION public.create_notification(
+    p_recipient_id UUID,
+    p_actor_id UUID,
+    p_type TEXT,
+    p_title TEXT,
+    p_body TEXT,
+    p_data JSONB
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF p_recipient_id IS NULL THEN
+        RETURN;
+    END IF;
+
+    INSERT INTO public.notifications (
+        recipient_id,
+        actor_id,
+        type,
+        title,
+        body,
+        data
+    )
+    VALUES (
+        p_recipient_id,
+        p_actor_id,
+        COALESCE(p_type, 'generic'),
+        COALESCE(p_title, 'Notification'),
+        p_body,
+        COALESCE(p_data, '{}'::jsonb)
+    );
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.notify_on_post_like()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_author_id UUID;
+BEGIN
+    SELECT p.author_id INTO v_author_id
+    FROM public.posts p
+    WHERE p.id = NEW.post_id;
+
+    IF v_author_id IS NULL OR v_author_id = NEW.user_id THEN
+        RETURN NEW;
+    END IF;
+
+    PERFORM public.create_notification(
+        v_author_id,
+        NEW.user_id,
+        'post_like',
+        'New like on your post',
+        NULL,
+        jsonb_build_object('post_id', NEW.post_id)
+    );
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_notify_post_like ON public.post_likes;
+CREATE TRIGGER trg_notify_post_like
+AFTER INSERT ON public.post_likes
+FOR EACH ROW
+EXECUTE FUNCTION public.notify_on_post_like();
+
+CREATE OR REPLACE FUNCTION public.notify_on_post_comment()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_author_id UUID;
+    v_preview TEXT;
+BEGIN
+    SELECT p.author_id INTO v_author_id
+    FROM public.posts p
+    WHERE p.id = NEW.post_id;
+
+    IF v_author_id IS NULL OR v_author_id = NEW.author_id THEN
+        RETURN NEW;
+    END IF;
+
+    v_preview := NULLIF(LEFT(COALESCE(NEW.content, ''), 180), '');
+
+    PERFORM public.create_notification(
+        v_author_id,
+        NEW.author_id,
+        'post_comment',
+        'New comment on your post',
+        v_preview,
+        jsonb_build_object('post_id', NEW.post_id, 'comment_id', NEW.id)
+    );
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_notify_post_comment ON public.comments;
+CREATE TRIGGER trg_notify_post_comment
+AFTER INSERT ON public.comments
+FOR EACH ROW
+EXECUTE FUNCTION public.notify_on_post_comment();
+
+CREATE OR REPLACE FUNCTION public.notify_on_group_join_request_created()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_creator_id UUID;
+BEGIN
+    SELECT g.created_by INTO v_creator_id
+    FROM public.groups g
+    WHERE g.id = NEW.group_id;
+
+    IF v_creator_id IS NOT NULL AND v_creator_id <> NEW.user_id THEN
+        PERFORM public.create_notification(
+            v_creator_id,
+            NEW.user_id,
+            'group_join_request',
+            'New group join request',
+            NULL,
+            jsonb_build_object('group_id', NEW.group_id, 'request_id', NEW.id)
+        );
+    END IF;
+
+    INSERT INTO public.notifications (recipient_id, actor_id, type, title, body, data)
+    SELECT
+        gm.user_id,
+        NEW.user_id,
+        'group_join_request',
+        'New group join request',
+        NULL,
+        jsonb_build_object('group_id', NEW.group_id, 'request_id', NEW.id)
+    FROM public.group_members gm
+    WHERE gm.group_id = NEW.group_id
+      AND gm.role IN ('admin', 'moderator')
+      AND gm.user_id <> NEW.user_id;
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_notify_group_join_request_created ON public.group_join_requests;
+CREATE TRIGGER trg_notify_group_join_request_created
+AFTER INSERT ON public.group_join_requests
+FOR EACH ROW
+EXECUTE FUNCTION public.notify_on_group_join_request_created();
+
+CREATE OR REPLACE FUNCTION public.notify_on_group_join_request_decided()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_group_name TEXT;
+    v_title TEXT;
+BEGIN
+    IF OLD.status = NEW.status THEN
+        RETURN NEW;
+    END IF;
+
+    IF NEW.status NOT IN ('approved', 'rejected') THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT g.name INTO v_group_name
+    FROM public.groups g
+    WHERE g.id = NEW.group_id;
+
+    v_title := CASE
+        WHEN NEW.status = 'approved' THEN 'Your join request was approved'
+        ELSE 'Your join request was rejected'
+    END;
+
+    PERFORM public.create_notification(
+        NEW.user_id,
+        NEW.decided_by,
+        'group_join_decision',
+        v_title,
+        v_group_name,
+        jsonb_build_object('group_id', NEW.group_id, 'request_id', NEW.id, 'status', NEW.status)
+    );
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_notify_group_join_request_decided ON public.group_join_requests;
+CREATE TRIGGER trg_notify_group_join_request_decided
+AFTER UPDATE ON public.group_join_requests
+FOR EACH ROW
+EXECUTE FUNCTION public.notify_on_group_join_request_decided();
+
+CREATE OR REPLACE FUNCTION public.notify_on_message_inserted()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_recipient_id UUID;
+    v_preview TEXT;
+BEGIN
+    SELECT CASE
+        WHEN c.user1_id = NEW.sender_id THEN c.user2_id
+        ELSE c.user1_id
+    END
+    INTO v_recipient_id
+    FROM public.chats c
+    WHERE c.id = NEW.chat_id;
+
+    IF v_recipient_id IS NULL OR v_recipient_id = NEW.sender_id THEN
+        RETURN NEW;
+    END IF;
+
+    v_preview := NULLIF(LEFT(COALESCE(NEW.content, ''), 180), '');
+
+    PERFORM public.create_notification(
+        v_recipient_id,
+        NEW.sender_id,
+        'message',
+        'New message',
+        v_preview,
+        jsonb_build_object('chat_id', NEW.chat_id, 'message_id', NEW.id)
+    );
+
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_notify_message_inserted ON public.messages;
+CREATE TRIGGER trg_notify_message_inserted
+AFTER INSERT ON public.messages
+FOR EACH ROW
+EXECUTE FUNCTION public.notify_on_message_inserted();
 
 
 -- ==============================================================================
@@ -403,12 +891,17 @@ SELECT
     (SELECT COUNT(*)::int FROM public.group_members gm WHERE gm.group_id = g.id) as members_count,
     
     -- Current user membership (requires auth.uid())
-    (SELECT role FROM public.group_members gm WHERE gm.group_id = g.id AND gm.user_id = auth.uid()) as user_role
+    (SELECT role FROM public.group_members gm WHERE gm.group_id = g.id AND gm.user_id = auth.uid()) as user_role,
+
+    gjr.status as join_request_status,
+    gjr.id as join_request_id
 
 FROM 
     public.groups g
 JOIN 
-    public.profiles pr ON g.created_by = pr.id;
+    public.profiles pr ON g.created_by = pr.id
+LEFT JOIN
+    public.group_join_requests gjr ON gjr.group_id = g.id AND gjr.user_id = auth.uid();
 
 GRANT SELECT ON public.groups_with_stats TO anon, authenticated, service_role;
 

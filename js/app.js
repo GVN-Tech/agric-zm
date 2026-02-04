@@ -10,8 +10,14 @@ class AppController {
         this.marketManager = null;
         this.groupsManager = null;
         this.messagingManager = null;
+        this.searchManager = null;
+        this.notificationsChannel = null;
+        this.notificationsCache = new Map();
+        this.unreadNotificationsCount = 0;
         this.currentView = 'landing';
         this.currentChatId = null;
+        this.currentChatType = 'direct';
+        this.currentGroupId = null;
         this.currentChatChannel = null;
         this.postLoginRedirect = null;
         this.routingInitialized = false;
@@ -23,6 +29,11 @@ class AppController {
         this.storiesStorageKey = 'agrilovers.stories.v1';
         this.storyDraftImage = null;
         this.farmerSearchDebounced = null;
+        this.feedReloadTimer = null;
+        this.chatNotificationChannels = [];
+        this.modalStack = [];
+        this.activeModalId = null;
+        this.modalAccessibilityInitialized = false;
     }
 
     async init() {
@@ -31,9 +42,12 @@ class AppController {
             this.setupRouting();
             this.setupLandingCarousel();
             this.setupResponsiveNav();
+            this.setupNavbarSearch();
             this.setupStories();
             this.setupFarmerDiscovery();
             this.setupComposer();
+            this.setupChatComposer();
+            this.setupModalAccessibility();
 
             const requestedView = this.getViewFromUrl();
 
@@ -64,6 +78,9 @@ class AppController {
             this.marketManager = new MarketManager(supabaseClient);
             this.groupsManager = new GroupsManager(supabaseClient);
             this.messagingManager = new MessagingManager(supabaseClient);
+            this.friendsManager = new FriendsManager(supabaseClient);
+            this.storiesManager = new StoriesManager(supabaseClient);
+            this.searchManager = typeof SearchManager === 'function' ? new SearchManager(supabaseClient) : null;
             this.toolsManager = new ToolsManager();
 
             if (this.authManager && typeof this.authManager.signInWithPassword !== 'function') {
@@ -115,8 +132,11 @@ class AppController {
                 this.handleAuthChange(isAuthenticated);
             };
 
-            // Initialize auth
             await this.authManager.init();
+            if (typeof this.authManager.waitForAuthReady === 'function') {
+                await this.authManager.waitForAuthReady();
+            }
+            await this.resolveAuthSession();
             this.handleAuthChange(this.authManager.isAuthenticated());
 
             // Load initial view
@@ -128,7 +148,10 @@ class AppController {
                 return;
             }
 
-            const initialView = requestedView && requestedView !== 'landing' ? requestedView : 'feed';
+            const lastView = this.getLastAuthedView();
+            const initialView = requestedView && requestedView !== 'landing'
+                ? requestedView
+                : (lastView || 'feed');
             this.switchView(initialView, false);
 
             // Set up realtime subscriptions
@@ -176,15 +199,353 @@ class AppController {
         apply();
     }
 
+    async resolveAuthSession() {
+        if (!this.supabase || !this.authManager) return;
+        const ensureProfile = async (user) => {
+            if (!user) return;
+            const hasProfile = typeof this.authManager.getProfile === 'function' ? this.authManager.getProfile() : null;
+            if (hasProfile) return;
+            if (typeof this.authManager.loadUserProfile === 'function') {
+                await this.authManager.loadUserProfile(user.id);
+            }
+        };
+
+        let authUser = typeof this.authManager.getUser === 'function' ? this.authManager.getUser() : null;
+        if (authUser) {
+            await ensureProfile(authUser);
+            return;
+        }
+
+        const attempts = [0, 250, 750];
+        for (let i = 0; i < attempts.length; i++) {
+            if (attempts[i]) {
+                await new Promise((resolve) => window.setTimeout(resolve, attempts[i]));
+            }
+            try {
+                if (this.supabase.auth?.getSession) {
+                    const { data: { session } } = await this.supabase.auth.getSession();
+                    if (session?.user) {
+                        this.authManager.currentUser = session.user;
+                        await ensureProfile(session.user);
+                        return;
+                    }
+                }
+                if (this.supabase.auth?.getUser) {
+                    const { data: { user } } = await this.supabase.auth.getUser();
+                    if (user) {
+                        this.authManager.currentUser = user;
+                        await ensureProfile(user);
+                        return;
+                    }
+                }
+            } catch (_) {
+            }
+        }
+    }
+
+    getLastAuthedView() {
+        try {
+            const value = window.localStorage.getItem('agrilovers.lastView') || '';
+            const view = value.trim().toLowerCase();
+            const allowed = new Set(['feed', 'showcase', 'market', 'groups', 'messages']);
+            return allowed.has(view) ? view : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    setupNavbarSearch() {
+        const host = document.getElementById('navbarSearch');
+        if (!host) return;
+
+        const input = host.querySelector('input.topbar-search') || host.querySelector('input');
+        if (!input) return;
+
+        if (host.dataset.ready === '1') return;
+        host.dataset.ready = '1';
+
+        host.style.position = 'relative';
+
+        const dropdown = document.createElement('div');
+        dropdown.className = 'navbar-search-dropdown';
+        dropdown.setAttribute('role', 'listbox');
+        dropdown.style.display = 'none';
+        host.appendChild(dropdown);
+
+        let hideTimer = null;
+        let activeQueryToken = 0;
+
+        const hide = () => {
+            dropdown.style.display = 'none';
+            dropdown.innerHTML = '';
+        };
+
+        const show = () => {
+            if (!dropdown.innerHTML.trim()) return;
+            dropdown.style.display = 'block';
+        };
+
+        const renderMessage = (title, text) => {
+            dropdown.innerHTML = `
+                <div class="navbar-search-empty">
+                    <div class="navbar-search-empty-title">${this.escapeHtml(title || '')}</div>
+                    <div class="navbar-search-empty-text">${this.escapeHtml(text || '')}</div>
+                </div>
+            `;
+            dropdown.style.display = 'block';
+        };
+
+        const renderSearchResults = (results, query, searchType = 'all') => {
+            const q = (query || '').trim();
+            const items = Array.isArray(results) ? results : [];
+
+            if (!items.length) {
+                renderMessage('No results', q ? `No ${searchType === 'all' ? 'results' : searchType + 's'} match "${q}".` : 'No results found.');
+                return;
+            }
+
+            // Group results by type
+            const groupedResults = {};
+            items.forEach(item => {
+                const type = item.type || 'farmer';
+                if (!groupedResults[type]) {
+                    groupedResults[type] = [];
+                }
+                groupedResults[type].push(item);
+            });
+
+            dropdown.innerHTML = Object.entries(groupedResults)
+                .map(([type, typeItems]) => {
+                    const title = this.getSearchTypeTitle(type);
+                    return `
+                        <div class="navbar-search-section">
+                            <div class="navbar-search-section-title">${title}</div>
+                            <div class="navbar-search-section-items">
+                                ${typeItems.slice(0, 5).map(item => this.renderSearchResultItem(item, type)).join('')}
+                            </div>
+                        </div>
+                    `;
+                }).join('');
+
+            dropdown.style.display = 'block';
+        };
+
+        const renderSearchSuggestions = (suggestions, query) => {
+            const q = (query || '').trim();
+            if (!suggestions.length) return;
+
+            dropdown.innerHTML += `
+                <div class="navbar-search-section">
+                    <div class="navbar-search-section-title">Suggestions</div>
+                    <div class="navbar-search-section-items">
+                        ${suggestions.slice(0, 5).map(suggestion => `
+                            <button class="navbar-search-suggestion" type="button" data-query="${this.escapeHtml(suggestion.query)}" data-type="${this.escapeHtml(suggestion.type)}">
+                                <div class="navbar-search-suggestion-icon">🔍</div>
+                                <div class="navbar-search-suggestion-text">
+                                    <div class="navbar-search-suggestion-query">${this.escapeHtml(suggestion.query)}</div>
+                                    <div class="navbar-search-suggestion-type">${this.escapeHtml(this.getSearchTypeTitle(suggestion.type))}</div>
+                                </div>
+                            </button>
+                        `).join('')}
+                    </div>
+                </div>
+            `;
+        };
+
+        const runSearch = async () => {
+            const q = String(input.value || '').trim();
+            if (q.length < 2) {
+                hide();
+                return;
+            }
+
+            const token = ++activeQueryToken;
+            dropdown.innerHTML = '<div class="spinner" style="margin: 14px auto;"></div>';
+            dropdown.style.display = 'block';
+
+            if (!this.authManager || !this.authManager.isAuthenticated()) {
+                renderMessage('Sign in to search', 'Create an account to search farmers, crops, and markets.');
+                return;
+            }
+
+            if (!this.searchManager || !this.searchManager.searchAll) {
+                renderMessage('Search unavailable', 'Configure Supabase to enable enhanced search.');
+                return;
+            }
+
+            try {
+                const { results, suggestions } = await this.withTimeout(
+                    this.searchManager.searchAll(q, { limit: 15 }),
+                    12000
+                );
+                
+                if (token !== activeQueryToken) return;
+                
+                if (results.length > 0) {
+                    renderSearchResults(results, q, 'all');
+                    if (suggestions.length > 0) {
+                        renderSearchSuggestions(suggestions, q);
+                    }
+                } else {
+                    renderMessage('No results found', `Try searching for farmers, crops, markets, or posts.`);
+                    
+                    // Show search suggestions even when no results
+                    if (suggestions.length > 0) {
+                        renderSearchSuggestions(suggestions, q);
+                    }
+                }
+            } catch (error) {
+                if (token !== activeQueryToken) return;
+                console.error('Enhanced search error:', error);
+                renderMessage('Search failed', 'Please try again.');
+                
+                // Fallback to basic farmer search
+                try {
+                    const myId = this.authManager?.getProfile?.()?.id || null;
+                    const farmers = await this.withTimeout(this.postsManager.searchFarmers({ query: q, limit: 8 }), 5000);
+                    if (token !== activeQueryToken) return;
+                    const filtered = (farmers || []).filter((f) => !myId || f.id !== myId);
+                    if (filtered.length > 0) {
+                        renderSearchResults(filtered.map(f => ({ ...f, type: 'farmer' })), q, 'farmer');
+                    } else {
+                        renderMessage('No farmers found', `No farmers match "${q}".`);
+                    }
+                } catch (fallbackError) {
+                    renderMessage('Search unavailable', 'Please check your connection.');
+                }
+            }
+        };
+
+        const schedule = this.debounce(runSearch, 250);
+
+        input.setAttribute('autocomplete', 'off');
+        input.setAttribute('autocapitalize', 'off');
+        input.setAttribute('spellcheck', 'false');
+
+        input.addEventListener('input', () => {
+            if (hideTimer) window.clearTimeout(hideTimer);
+            schedule();
+        });
+
+        input.addEventListener('focus', () => {
+            if (hideTimer) window.clearTimeout(hideTimer);
+            if (String(input.value || '').trim().length >= 2) {
+                if (dropdown.innerHTML.trim()) show();
+                schedule();
+            }
+        });
+
+        input.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                hide();
+                input.blur();
+                return;
+            }
+            if (event.key === 'Enter') {
+                const first = dropdown.querySelector('.navbar-search-item');
+                if (first) {
+                    event.preventDefault();
+                    first.click();
+                }
+            }
+        });
+
+        host.addEventListener('focusout', () => {
+            if (hideTimer) window.clearTimeout(hideTimer);
+            hideTimer = window.setTimeout(() => {
+                const active = document.activeElement;
+                if (!active || !host.contains(active)) hide();
+            }, 140);
+        });
+
+        dropdown.addEventListener('mousedown', (event) => {
+            event.preventDefault();
+        });
+
+        dropdown.addEventListener('click', async (event) => {
+            const target = event.target instanceof Element ? event.target : null;
+            
+            // Handle search result items
+            const resultItem = target ? target.closest('.navbar-search-item') : null;
+            if (resultItem) {
+                const userId = String(resultItem.getAttribute('data-user-id') || '').trim();
+                const postId = String(resultItem.getAttribute('data-post-id') || '').trim();
+                const groupId = String(resultItem.getAttribute('data-group-id') || '').trim();
+                const marketId = String(resultItem.getAttribute('data-market-id') || '').trim();
+                
+                hide();
+                
+                if (userId) {
+                    try {
+                        await this.openFarmerProfile(userId);
+                    } catch (_) {}
+                } else if (postId) {
+                    try {
+                        await this.openPostDetail(postId);
+                    } catch (_) {}
+                } else if (groupId) {
+                    try {
+                        await this.openGroupDetail(groupId);
+                    } catch (_) {}
+                } else if (marketId) {
+                    try {
+                        await this.openMarketDetail(marketId);
+                    } catch (_) {}
+                }
+                return;
+            }
+            
+            // Handle search suggestions
+            const suggestionItem = target ? target.closest('.navbar-search-suggestion') : null;
+            if (suggestionItem) {
+                const query = String(suggestionItem.getAttribute('data-query') || '').trim();
+                const type = String(suggestionItem.getAttribute('data-type') || '').trim();
+                
+                if (query) {
+                    input.value = query;
+                    input.focus();
+                    runSearch();
+                }
+                return;
+            }
+        });
+
+        document.addEventListener('click', (event) => {
+            const target = event.target instanceof Node ? event.target : null;
+            if (!target) return;
+            if (!host.contains(target)) hide();
+        });
+    }
+
     setupStories() {
         const row = document.getElementById('storiesRow');
         if (!row) return;
 
-        const addBtn = document.getElementById('addStoryBtn') || row.querySelector('.story-add');
-        const createForm = document.getElementById('storyCreateForm');
+        // Load initial stories
+        this.loadStories();
+
+        const addBtn = document.getElementById('addStoryBtn');
+        if (addBtn) {
+            addBtn.onclick = () => this.openStoryCreateModal();
+        }
+        
         const imageInput = document.getElementById('storyImageInput');
         const imagePreview = document.getElementById('storyImagePreview');
-        const captionInput = document.getElementById('storyCaption');
+
+        // Setup image preview
+        if (imageInput && imagePreview) {
+            imageInput.onchange = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (evt) => {
+                    imagePreview.innerHTML = `<img src="${evt.target.result}" style="max-height: 200px; width: auto; display: block; margin: 0 auto;">`;
+                    imagePreview.style.display = 'block';
+                };
+                reader.readAsDataURL(file);
+            };
+        }
 
         const startDragScroll = () => {
             let isDown = false;
@@ -226,151 +587,144 @@ class AppController {
             }, { passive: false });
         };
 
-        const saveStories = (stories) => {
-            try {
-                localStorage.setItem(this.storiesStorageKey, JSON.stringify(stories));
-            } catch (_) {}
-        };
-
-        const loadStories = () => {
-            try {
-                const raw = localStorage.getItem(this.storiesStorageKey);
-                if (!raw) return [];
-                const parsed = JSON.parse(raw);
-                return Array.isArray(parsed) ? parsed : [];
-            } catch (_) {
-                return [];
-            }
-        };
-
-        const renderStoryElement = (story) => {
-            const el = document.createElement('div');
-            el.className = 'story';
-            el.dataset.storyId = story.id;
-            el.dataset.storyTitle = story.title || 'Story';
-            el.dataset.storyType = story.type || 'emoji';
-            el.dataset.storyCreatedAt = story.createdAt || '';
-            if (story.imageDataUrl) {
-                el.style.setProperty('--story-image', `url("${story.imageDataUrl}")`);
-            }
-
-            const img = document.createElement('div');
-            img.className = 'story-image';
-            img.textContent = story.type === 'image' ? '📷' : (story.emoji || '🌱');
-
-            const label = document.createElement('div');
-            label.className = 'story-label';
-            label.textContent = story.title || 'Story';
-
-            el.appendChild(img);
-            el.appendChild(label);
-            return el;
-        };
-
-        const setupCreateModal = () => {
-            if (!createForm || !imageInput || !captionInput || !imagePreview) return;
-
-            const showPreview = (dataUrl) => {
-                imagePreview.style.display = dataUrl ? '' : 'none';
-                imagePreview.innerHTML = dataUrl ? `<img src="${dataUrl}" alt="Story preview">` : '';
-            };
-
-            imageInput.addEventListener('change', async () => {
-                const file = imageInput.files && imageInput.files[0];
-                if (!file) {
-                    this.storyDraftImage = null;
-                    showPreview(null);
-                    return;
-                }
-
-                try {
-                    this.storyDraftImage = await this.prepareStoryImage(file);
-                    showPreview(this.storyDraftImage);
-                } catch (error) {
-                    console.error('Story image processing failed:', error);
-                    this.storyDraftImage = null;
-                    showPreview(null);
-                    this.showAlert('Could not load that image. Try a smaller photo.', 'error');
-                }
-            });
-        };
-
-        const setupAddButton = () => {
-            if (!addBtn) return;
-
-            const openCreate = () => {
-                this.storyDraftImage = null;
-                if (imageInput) imageInput.value = '';
-                if (captionInput) captionInput.value = '';
-                if (imagePreview) {
-                    imagePreview.style.display = 'none';
-                    imagePreview.innerHTML = '';
-                }
-                this.openModal('storyCreateModal');
-            };
-
-            addBtn.addEventListener('click', openCreate);
-            addBtn.addEventListener('keydown', (event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    openCreate();
-                }
-            });
-        };
-
-        const setupStoryViewer = () => {
-            row.addEventListener('click', (event) => {
-                const target = event.target instanceof Element ? event.target : null;
-                if (!target) return;
-                const storyEl = target.closest('.story');
-                if (!storyEl || storyEl.classList.contains('story-add')) return;
-
-                const title = storyEl.dataset.storyTitle || 'Story';
-                const type = storyEl.dataset.storyType || 'emoji';
-                const createdAt = storyEl.dataset.storyCreatedAt || '';
-                const storyId = storyEl.dataset.storyId || '';
-                const stored = loadStories();
-                const storedStory = stored.find((s) => String(s.id) === String(storyId));
-
-                const viewerTitle = document.getElementById('storyViewerTitle');
-                const viewerMedia = document.getElementById('storyViewerMedia');
-                const viewerMeta = document.getElementById('storyViewerMeta');
-
-                if (viewerTitle) viewerTitle.textContent = title;
-                if (viewerMeta) viewerMeta.textContent = createdAt ? this.formatTimeAgo(createdAt) : '';
-
-                if (viewerMedia) {
-                    const storyImage = storedStory?.imageDataUrl;
-                    if (type === 'image' && storyImage) {
-                        viewerMedia.innerHTML = `<img src="${storyImage}" alt="${this.escapeHtml(title)}">`;
-                    } else {
-                        const emoji = (storedStory && storedStory.emoji) ? storedStory.emoji : (storyEl.querySelector('.story-image')?.textContent || '🌿');
-                        viewerMedia.innerHTML = `<div class="story-emoji">${this.escapeHtml(emoji)}</div>`;
-                    }
-                }
-
-                this.openModal('storyViewerModal');
-            });
-        };
-
-        const hydrateSavedStories = () => {
-            const saved = loadStories();
-            if (!saved.length) return;
-            const insertPoint = row.querySelector('.story-add')?.nextSibling || null;
-            saved
-                .slice()
-                .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
-                .forEach((story) => {
-                    const el = renderStoryElement(story);
-                    row.insertBefore(el, insertPoint);
-                });
-        };
-
         startDragScroll();
-        setupCreateModal();
-        setupAddButton();
-        setupStoryViewer();
-        hydrateSavedStories();
+    }
+
+    async loadStories() {
+        if (!this.storiesManager) return;
+
+        const row = document.getElementById('storiesRow');
+        if (!row) return;
+
+        // Keep the "Add Story" button
+        const addBtnHtml = `
+            <div class="story story-add" id="addStoryBtn" role="button" tabindex="0" aria-label="Add Story" onclick="App.openStoryCreateModal()">
+                <div class="story-image">+</div>
+                <div class="story-label">Add Story</div>
+            </div>
+        `;
+
+        try {
+            const storyGroups = await this.storiesManager.getActiveStories();
+            
+            const storiesHtml = storyGroups.map(group => {
+                const user = group.user;
+                const hasUnseen = group.hasUnseen;
+                
+                return `
+                    <div class="story ${hasUnseen ? 'unseen' : ''}" 
+                         onclick="App.openStoryViewer('${user.id}')">
+                        <div class="story-image-wrapper">
+                            ${this.renderAvatarHtml(user.avatar_url, user.first_name, user.last_name)}
+                        </div>
+                        <div class="story-label">${this.escapeHtml(user.first_name)}</div>
+                    </div>
+                `;
+            }).join('');
+
+            row.innerHTML = addBtnHtml + storiesHtml;
+        } catch (error) {
+            console.error('Load stories error:', error);
+            // Fallback to just showing add button if error
+            row.innerHTML = addBtnHtml;
+        }
+    }
+
+    openStoryCreateModal() {
+        if (!this.authManager || !this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+        this.openModal('storyCreateModal');
+    }
+
+    async openStoryViewer(userId) {
+        if (!this.storiesManager) return;
+
+        try {
+            const storyGroups = await this.storiesManager.getActiveStories();
+            const group = storyGroups.find(g => g.user.id === userId);
+            
+            if (!group || !group.stories.length) return;
+
+            this.currentStoryGroup = group;
+            this.currentStoryIndex = 0;
+            
+            this.openModal('storyViewerModal');
+            this.renderStorySlide();
+        } catch (error) {
+            console.error('Open story viewer error:', error);
+        }
+    }
+
+    async renderStorySlide() {
+        if (!this.currentStoryGroup) return;
+        
+        const story = this.currentStoryGroup.stories[this.currentStoryIndex];
+        const user = this.currentStoryGroup.user;
+        const container = document.getElementById('storyViewerMedia');
+        const meta = document.getElementById('storyViewerMeta');
+        
+        if (!story) return;
+
+        // Mark as viewed
+        this.storiesManager.viewStory(story.id).catch(console.error);
+
+        container.innerHTML = `
+            <img src="${story.image_url}" alt="Story" style="width: 100%; height: 100%; object-fit: contain; background: #000;">
+        `;
+
+        meta.innerHTML = `
+            <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px; color: white; background: rgba(0,0,0,0.5); position: absolute; bottom: 0; left: 0; right: 0;">
+                <div>
+                    <strong>${this.escapeHtml(user.first_name)} ${this.escapeHtml(user.last_name)}</strong>
+                    <div>${this.escapeHtml(story.caption || '')}</div>
+                    <small>${this.formatTimeAgo(story.created_at)}</small>
+                </div>
+                ${this.authManager.getProfile()?.id === user.id ? `
+                    <button class="btn btn-icon" style="color: white;" onclick="App.deleteStory('${story.id}')">🗑️</button>
+                ` : ''}
+            </div>
+            <div class="story-nav" style="position: absolute; top: 50%; width: 100%; display: flex; justify-content: space-between; padding: 0 10px; pointer-events: none;">
+                <button class="btn btn-icon" style="pointer-events: auto; background: rgba(255,255,255,0.2); color: white;" onclick="App.prevStory()">❮</button>
+                <button class="btn btn-icon" style="pointer-events: auto; background: rgba(255,255,255,0.2); color: white;" onclick="App.nextStory()">❯</button>
+            </div>
+        `;
+    }
+
+    nextStory() {
+        if (!this.currentStoryGroup) return;
+        
+        if (this.currentStoryIndex < this.currentStoryGroup.stories.length - 1) {
+            this.currentStoryIndex++;
+            this.renderStorySlide();
+        } else {
+            this.closeModal('storyViewerModal');
+            this.loadStories(); // Refresh seen status
+        }
+    }
+
+    prevStory() {
+        if (!this.currentStoryGroup) return;
+        
+        if (this.currentStoryIndex > 0) {
+            this.currentStoryIndex--;
+            this.renderStorySlide();
+        }
+    }
+
+    async deleteStory(storyId) {
+        if (!confirm('Delete this story?')) return;
+        
+        try {
+            await this.storiesManager.deleteStory(storyId);
+            this.showToast('Story deleted');
+            this.closeModal('storyViewerModal');
+            await this.loadStories();
+        } catch (error) {
+            console.error('Delete story error:', error);
+            this.showToast('Failed to delete story', 'error');
+        }
     }
 
     setupFarmerDiscovery() {
@@ -400,103 +754,66 @@ class AppController {
         });
     }
 
-    async prepareStoryImage(file) {
-        const maxSize = 1080;
-        const quality = 0.84;
+    setupChatComposer() {
+        const input = document.getElementById('chatAttachmentInput');
+        const list = document.getElementById('chatAttachmentList');
+        if (!input || !list) return;
 
-        const bitmap = (window.createImageBitmap ? await window.createImageBitmap(file) : null);
-        if (!bitmap) {
-            const dataUrl = await new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(String(reader.result || ''));
-                reader.onerror = () => reject(new Error('file read failed'));
-                reader.readAsDataURL(file);
-            });
-            return dataUrl;
-        }
-
-        const scale = Math.min(1, maxSize / Math.max(bitmap.width, bitmap.height));
-        const width = Math.max(1, Math.round(bitmap.width * scale));
-        const height = Math.max(1, Math.round(bitmap.height * scale));
-
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) return '';
-
-        ctx.drawImage(bitmap, 0, 0, width, height);
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
-        try { bitmap.close(); } catch (_) {}
-        return dataUrl;
-    }
-
-    handleStoryCreate(event) {
-        event.preventDefault();
-
-        const row = document.getElementById('storiesRow');
-        const captionInput = document.getElementById('storyCaption');
-        if (!row) return;
-
-        const title = (captionInput && captionInput.value ? captionInput.value.trim() : '') || 'My Story';
-        const createdAt = new Date().toISOString();
-
-        const story = {
-            id: `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-            type: this.storyDraftImage ? 'image' : 'emoji',
-            title,
-            emoji: this.storyDraftImage ? null : '🌿',
-            imageDataUrl: this.storyDraftImage || null,
-            createdAt
-        };
-
-        let stored = [];
-        try {
-            const raw = localStorage.getItem(this.storiesStorageKey);
-            stored = raw ? JSON.parse(raw) : [];
-            if (!Array.isArray(stored)) stored = [];
-        } catch (_) {
-            stored = [];
-        }
-
-        stored.unshift(story);
-        try {
-            localStorage.setItem(this.storiesStorageKey, JSON.stringify(stored.slice(0, 30)));
-        } catch (_) {}
-
-        const addEl = document.getElementById('addStoryBtn') || row.querySelector('.story-add');
-        const el = (() => {
-            const wrap = document.createElement('div');
-            wrap.className = 'story';
-            wrap.dataset.storyId = story.id;
-            wrap.dataset.storyTitle = story.title;
-            wrap.dataset.storyType = story.type;
-            wrap.dataset.storyCreatedAt = story.createdAt;
-            if (story.imageDataUrl) {
-                wrap.style.setProperty('--story-image', `url("${story.imageDataUrl}")`);
+        const renderList = () => {
+            const files = Array.from(input.files || []);
+            if (!files.length) {
+                list.innerHTML = '';
+                return;
             }
 
-            const img = document.createElement('div');
-            img.className = 'story-image';
-            img.textContent = story.type === 'image' ? '📷' : (story.emoji || '🌿');
+            list.innerHTML = files.map((file) => {
+                const size = this.formatFileSize(file.size || 0);
+                return `
+                    <div class="chat-attachment-item">
+                        <span class="chat-attachment-name">${this.escapeHtml(file.name || 'file')}</span>
+                        <span class="chat-attachment-size">${this.escapeHtml(size)}</span>
+                    </div>
+                `;
+            }).join('');
+        };
 
-            const label = document.createElement('div');
-            label.className = 'story-label';
-            label.textContent = story.title;
+        input.addEventListener('change', renderList);
+    }
 
-            wrap.appendChild(img);
-            wrap.appendChild(label);
-            return wrap;
-        })();
+    async handleStoryCreate(event) {
+        event.preventDefault();
+        
+        const fileInput = document.getElementById('storyImageInput');
+        const captionInput = document.getElementById('storyCaption');
+        const file = fileInput?.files?.[0];
+        const caption = captionInput?.value?.trim();
 
-        if (addEl && addEl.nextSibling) {
-            row.insertBefore(el, addEl.nextSibling);
-        } else {
-            row.appendChild(el);
+        if (!file) {
+            this.showToast('Please select an image', 'error');
+            return;
         }
 
-        this.closeModal('storyCreateModal');
-        this.showAlert('Story posted', 'success');
+        try {
+            this.showLoading(true);
+            await this.storiesManager.createStory(file, caption);
+            this.showToast('Story posted!', 'success');
+            this.closeModal('storyCreateModal');
+            
+            // Reset form
+            document.getElementById('storyCreateForm').reset();
+            const preview = document.getElementById('storyImagePreview');
+            if (preview) {
+                preview.innerHTML = '';
+                preview.style.display = 'none';
+            }
+            
+            await this.loadStories();
+        } catch (error) {
+            console.error('Create story error:', error);
+            this.showToast('Failed to post story', 'error');
+        } finally {
+            this.showLoading(false);
+        }
     }
 
     // Load Weather
@@ -597,23 +914,99 @@ class AppController {
 
     // Show preview mode with demo data
     showPreviewMode() {
-        // Double check configuration before showing preview
-        if (SUPABASE_CONFIG.url !== 'YOUR_SUPABASE_URL' && SUPABASE_CONFIG.anonKey !== 'YOUR_SUPABASE_ANON_KEY') {
-             // Config is valid, do not show preview mode
-             const container = document.getElementById('previewModeContainer');
-             if (container) container.style.display = 'none';
-             const postsContainer = document.getElementById('postsContainer');
-             if (postsContainer) postsContainer.style.display = 'block';
-             return;
+        if (this.isSupabaseConfigured()) {
+            const container = document.getElementById('previewModeContainer');
+            if (container) container.style.display = 'none';
+            const postsContainer = document.getElementById('postsContainer');
+            if (postsContainer) postsContainer.style.display = 'block';
+            return;
         }
 
-        // We do NOT want to show preview mode if we have valid config!
-        // This function is only called if configuration check fails.
         const container = document.getElementById('previewModeContainer');
         if (container) {
             container.style.display = 'block';
             document.getElementById('postsContainer').style.display = 'none';
         }
+    }
+
+    isSupabaseConfigured() {
+        return !!(
+            SUPABASE_CONFIG &&
+            SUPABASE_CONFIG.url &&
+            SUPABASE_CONFIG.url !== 'YOUR_SUPABASE_URL' &&
+            SUPABASE_CONFIG.anonKey &&
+            SUPABASE_CONFIG.anonKey !== 'YOUR_SUPABASE_ANON_KEY'
+        );
+    }
+
+    getSupabaseErrorInfo(error, fallbackTitle) {
+        const code = error?.code || error?.error?.code || null;
+        const status = error?.status || error?.error?.status || null;
+        const rawMessage = String(error?.message || error?.error_description || error?.details || error || '');
+        const message = rawMessage.toLowerCase();
+
+        if (code === '42P01' || message.includes('does not exist') || message.includes('undefined table')) {
+            return {
+                title: 'Database setup required',
+                text: 'Run database/COMPLETE_SETUP.sql in Supabase SQL Editor.'
+            };
+        }
+
+        if (message.includes('request timed out') || message.includes('timed out')) {
+            return {
+                title: 'Request timed out',
+                text: 'Check your network connection and Supabase availability.'
+            };
+        }
+
+        if (
+            status === 401 ||
+            status === 403 ||
+            message.includes('jwt') ||
+            message.includes('permission denied') ||
+            message.includes('not authorized') ||
+            message.includes('rls')
+        ) {
+            return {
+                title: 'Access denied',
+                text: 'Sign in again and verify RLS policies are installed.'
+            };
+        }
+
+        if (
+            message.includes('failed to fetch') ||
+            message.includes('networkerror') ||
+            message.includes('fetch failed') ||
+            message.includes('enotfound') ||
+            message.includes('cors')
+        ) {
+            return {
+                title: 'Cannot reach Supabase',
+                text: 'Check your Project URL, anon key, and network connectivity.'
+            };
+        }
+
+        return {
+            title: fallbackTitle || 'Could not load data',
+            text: 'Please check your Supabase configuration.'
+        };
+    }
+
+    buildEmptyStateHtml(icon, title, text, style = '') {
+        const styleAttr = style ? ` style="${style}"` : '';
+        return `
+            <div class="empty-state"${styleAttr}>
+                <div class="empty-state-icon">${icon}</div>
+                <h3 class="empty-state-title">${this.escapeHtml(title || '')}</h3>
+                <p class="empty-state-text">${this.escapeHtml(text || '')}</p>
+            </div>
+        `;
+    }
+
+    renderSupabaseError(container, icon, fallbackTitle, error, style = '') {
+        if (!container) return;
+        const info = this.getSupabaseErrorInfo(error, fallbackTitle);
+        container.innerHTML = this.buildEmptyStateHtml(icon, info.title, info.text, style);
     }
 
     renderPreviewContentForView(viewName) {
@@ -700,6 +1093,23 @@ class AppController {
                 id: 'demo-chat-2',
                 other_user: { first_name: 'Moses', last_name: 'B.', avatar_url: null },
                 unread_count: 0
+            }
+        ];
+
+        const demoGroupChats = [
+            {
+                id: 'demo-group-1',
+                name: 'Maize Growers',
+                group_type: 'crop',
+                crop_tag: 'Maize',
+                unread_count: 0
+            },
+            {
+                id: 'demo-group-2',
+                name: 'Lusaka Cooperative',
+                group_type: 'regional',
+                province: 'Lusaka',
+                unread_count: 2
             }
         ];
 
@@ -792,14 +1202,17 @@ class AppController {
                             <h3 class="empty-state-title">Messages (preview)</h3>
                             <p class="empty-state-text">Connect Supabase to load chats and send messages.</p>
                         </div>
-                    ` + demoChats.map((chat) => {
+                    ` + `
+                        <div class="chat-section">
+                            <div class="chat-section-title">Direct</div>
+                            ${demoChats.map((chat) => {
                         const otherUser = chat.other_user || {};
-                        const avatar = otherUser.avatar_url || this.getInitials(otherUser.first_name, otherUser.last_name);
                         const name = `${otherUser.first_name || ''} ${otherUser.last_name || ''}`.trim() || 'Farmer';
+                        const avatarHtml = this.renderAvatarHtml(otherUser.avatar_url, otherUser.first_name, otherUser.last_name, name);
                         return `
                             <div class="card chat-card" aria-disabled="true">
                                 <div class="chat-card-content">
-                                    <div class="post-avatar">${avatar}</div>
+                                    <div class="post-avatar">${avatarHtml}</div>
                                     <div class="chat-info">
                                         <h4 class="chat-name">${this.escapeHtml(name)}</h4>
                                         ${chat.unread_count ? `<span class="badge badge-error">${chat.unread_count} new</span>` : ''}
@@ -807,7 +1220,27 @@ class AppController {
                                 </div>
                             </div>
                         `;
-                    }).join('');
+                    }).join('')}
+                        </div>
+                        <div class="chat-section">
+                            <div class="chat-section-title">Groups</div>
+                            ${demoGroupChats.map((group) => {
+                                const metaParts = [group.group_type, group.crop_tag || group.province].filter(Boolean);
+                                const meta = metaParts.join(' • ');
+                                return `
+                                    <div class="card chat-card" aria-disabled="true">
+                                        <div class="chat-card-content">
+                                            <div class="post-avatar">👥</div>
+                                            <div class="chat-info">
+                                                <h4 class="chat-name">${this.escapeHtml(group.name || 'Group')}</h4>
+                                                ${meta ? `<div class="post-meta">${this.escapeHtml(meta)}</div>` : ''}
+                                            </div>
+                                        </div>
+                                    </div>
+                                `;
+                            }).join('')}
+                        </div>
+                    `;
                 }
                 break;
             }
@@ -825,7 +1258,15 @@ class AppController {
             if (profile) {
                 postComposer.style.display = 'block';
                 priceReportForm.style.display = 'block';
-                accountNavBtn.textContent = `👤 ${profile.first_name}`;
+                if (accountNavBtn) {
+                    const iconEl = accountNavBtn.querySelector('.nav-icon');
+                    if (iconEl) iconEl.textContent = '👤';
+                    const labelEl = accountNavBtn.querySelector('span');
+                    if (labelEl) labelEl.textContent = profile.first_name || 'Me';
+                }
+                this.setupChatNotificationSubscriptions();
+                this.setupNotificationSubscriptions();
+                this.refreshNotificationsBadge();
                 const redirectView = this.postLoginRedirect;
                 if (redirectView) {
                     this.postLoginRedirect = null;
@@ -845,12 +1286,24 @@ class AppController {
                 const accountSpan = accountNavBtn.querySelector('span');
                 if (accountSpan) accountSpan.textContent = 'Me';
             }
-            this.switchView('landing', false);
+            if (this.currentView === 'landing') {
+                this.switchView('feed', false);
+            } else {
+                this.applyLayoutForView(this.currentView);
+            }
             this.openModal('profileModal');
         } else {
+            this.teardownChatNotificationSubscriptions();
+            this.teardownNotificationSubscriptions();
+            this.setUnreadNotificationsCount(0);
             postComposer.style.display = 'none';
             priceReportForm.style.display = 'none';
-            accountNavBtn.textContent = '👤 Account';
+            if (accountNavBtn) {
+                const iconEl = accountNavBtn.querySelector('.nav-icon');
+                if (iconEl) iconEl.textContent = '👤';
+                const labelEl = accountNavBtn.querySelector('span');
+                if (labelEl) labelEl.textContent = 'Me';
+            }
             if (this.currentView !== 'landing') {
                 this.switchView('landing');
             }
@@ -957,41 +1410,148 @@ class AppController {
         const root = document.getElementById('landingCarousel');
         if (!root) return;
 
-        const track = root.querySelector('.landing-carousel-track');
-        const slides = Array.from(root.querySelectorAll('.landing-carousel-slide'));
-        const dots = Array.from(root.querySelectorAll('.landing-carousel-dot'));
-        const prevBtn = root.querySelector('.landing-carousel-prev');
-        const nextBtn = root.querySelector('.landing-carousel-next');
-        const captionEl = document.getElementById('landingCarouselCaption');
+        const layers = Array.from(root.querySelectorAll('.landing-hero-bg-layer'));
+        if (layers.length < 2) return;
 
-        if (!track || slides.length === 0) return;
+        const captionEl = document.getElementById('landingHeroCaption');
+        const stripRoot = document.getElementById('landingPhotoStrip');
+
+        const captionPhrases = [
+            'Better prices, together.',
+            'Get local tips from farmers near you.',
+            'Share harvest updates and learn faster.',
+            'Find buyers and sell smarter.',
+            'Spot pests early with community alerts.',
+            'Build trusted groups across Zambia.',
+            'Real farms. Real markets. Real support.',
+            'Mobile-first and low-data friendly.'
+        ];
+
+        const imageUrls = [
+            'assets/IMG-20260203-WA0056.jpg',
+            'assets/IMG-20260203-WA0055.jpg',
+            'assets/IMG-20260203-WA0054.jpg',
+            'assets/IMG-20260203-WA0052.jpg',
+            'assets/IMG-20260203-WA0051.jpg',
+            'assets/IMG-20260203-WA0044.jpg',
+            'assets/IMG-20260203-WA0041.jpg',
+            'assets/IMG-20260203-WA0039.jpg',
+            'assets/IMG-20260203-WA0038.jpg',
+            'assets/IMG-20260203-WA0036.jpg',
+            'assets/IMG-20260203-WA0035.jpg',
+            'assets/IMG-20260203-WA0034.jpg',
+            'assets/IMG-20260203-WA0032.jpg',
+            'assets/IMG-20260203-WA0031.jpg',
+            'assets/IMG-20260203-WA0030.jpg',
+            'assets/IMG-20260203-WA0026.jpg',
+            'assets/IMG-20260203-WA0025.jpg',
+            'assets/IMG-20260203-WA0023.jpg',
+            'assets/IMG-20260203-WA0022.jpg',
+            'assets/IMG-20260203-WA0021.jpg',
+            'assets/IMG-20260203-WA0019.jpg',
+            'assets/IMG-20260203-WA0017.jpg',
+            'assets/IMG-20260203-WA0013.jpg',
+            'assets/IMG-20260203-WA0012.jpg',
+            'assets/IMG-20260203-WA0010.jpg'
+        ];
+
+        const slides = imageUrls.map((url, slideIndex) => ({
+            url,
+            caption: captionPhrases[slideIndex % captionPhrases.length]
+        }));
+
+        let stripButtons = [];
+        if (stripRoot) {
+            const fragment = document.createDocumentFragment();
+            slides.forEach((slide, slideIndex) => {
+                const btn = document.createElement('button');
+                btn.className = `landing-photo-strip-btn${slideIndex === 0 ? ' is-active' : ''}`;
+                btn.type = 'button';
+                btn.dataset.index = String(slideIndex);
+                btn.setAttribute('aria-label', `Photo ${slideIndex + 1}`);
+
+                const img = document.createElement('img');
+                img.src = slide.url;
+                img.alt = `Farm photo ${slideIndex + 1}`;
+                img.loading = 'lazy';
+                img.decoding = 'async';
+
+                btn.appendChild(img);
+                fragment.appendChild(btn);
+            });
+            stripRoot.replaceChildren(fragment);
+            stripButtons = Array.from(stripRoot.querySelectorAll('.landing-photo-strip-btn'));
+        }
 
         const prefersReducedMotion = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
         let index = 0;
         let timer = null;
         let paused = false;
-        let startX = null;
-        let lastX = null;
+        let activeLayer = Math.max(0, layers.findIndex(layer => layer.classList.contains('is-active')));
+        if (activeLayer >= layers.length) activeLayer = 0;
+        let switching = false;
 
-        const setDotState = (activeIndex) => {
-            if (!dots.length) return;
-            dots.forEach((dot, dotIndex) => {
-                dot.classList.toggle('active', dotIndex === activeIndex);
-            });
+        const host = root.closest('.landing-hero') || root;
+
+        const normalizeIndex = (nextIndex) => ((nextIndex % slides.length) + slides.length) % slides.length;
+
+        const preload = (url) => new Promise((resolve) => {
+            const img = new Image();
+            img.onload = () => resolve(true);
+            img.onerror = () => resolve(false);
+            img.src = url;
+        });
+
+        const setLayerImage = (layerIndex, url) => {
+            layers[layerIndex].style.backgroundImage = `url("${url}")`;
         };
 
         const setCaption = (activeIndex) => {
             if (!captionEl) return;
-            const caption = slides[activeIndex]?.dataset?.caption || '';
-            captionEl.textContent = caption;
+            const text = slides[activeIndex]?.caption || '';
+            const nodes = captionEl.querySelectorAll('.landing-hero-ticker-text');
+            nodes.forEach((node) => {
+                node.textContent = text;
+            });
+            const track = captionEl.querySelector('.landing-hero-ticker-track');
+            if (track) {
+                track.style.animation = 'none';
+                track.offsetHeight;
+                track.style.animation = '';
+            }
         };
 
-        const goTo = (nextIndex) => {
-            const safeIndex = ((nextIndex % slides.length) + slides.length) % slides.length;
+        const setStripState = (activeIndex) => {
+            if (!stripButtons.length) return;
+            stripButtons.forEach((btn) => {
+                const btnIndex = Number(btn.dataset.index);
+                btn.classList.toggle('is-active', btnIndex === activeIndex);
+            });
+        };
+
+        const goTo = async (nextIndex) => {
+            if (!slides.length) return;
+            if (switching) return;
+            switching = true;
+
+            const safeIndex = normalizeIndex(nextIndex);
+            const nextUrl = slides[safeIndex].url;
+            const incomingLayer = activeLayer === 0 ? 1 : 0;
+
+            await preload(nextUrl);
+            setLayerImage(incomingLayer, nextUrl);
+
+            layers[incomingLayer].classList.add('is-active');
+            layers[activeLayer].classList.remove('is-active');
+
+            activeLayer = incomingLayer;
             index = safeIndex;
-            track.style.transform = `translateX(-${safeIndex * 100}%)`;
-            setDotState(safeIndex);
             setCaption(safeIndex);
+            setStripState(safeIndex);
+
+            const nextPreloadUrl = slides[normalizeIndex(safeIndex + 1)]?.url;
+            if (nextPreloadUrl) preload(nextPreloadUrl);
+            window.setTimeout(() => { switching = false; }, 950);
         };
 
         const stop = () => {
@@ -1010,10 +1570,19 @@ class AppController {
             }, 6500);
         };
 
-        setDotState(0);
-        setCaption(0);
-        goTo(0);
-        start();
+        if (slides.length) {
+            const initialUrl = slides[0].url;
+            setCaption(0);
+            setStripState(0);
+            preload(initialUrl).finally(() => {
+                setLayerImage(activeLayer, initialUrl);
+                layers[activeLayer].classList.add('is-active');
+                layers[activeLayer === 0 ? 1 : 0].classList.remove('is-active');
+                const nextPreloadUrl = slides[normalizeIndex(1)]?.url;
+                if (nextPreloadUrl) preload(nextPreloadUrl);
+            });
+            start();
+        }
 
         const pause = () => {
             paused = true;
@@ -1023,61 +1592,23 @@ class AppController {
             paused = false;
         };
 
-        if (prevBtn) {
-            prevBtn.addEventListener('click', () => {
-                goTo(index - 1);
-            });
-        }
+        host.addEventListener('mouseenter', pause);
+        host.addEventListener('mouseleave', resume);
+        host.addEventListener('focusin', pause);
+        host.addEventListener('focusout', resume);
 
-        if (nextBtn) {
-            nextBtn.addEventListener('click', () => {
-                goTo(index + 1);
-            });
-        }
-
-        if (dots.length) {
-            dots.forEach((dot, dotIndex) => {
-                dot.addEventListener('click', () => {
-                    goTo(dotIndex);
+        if (stripButtons.length) {
+            stripButtons.forEach((btn) => {
+                btn.addEventListener('click', () => {
+                    const targetIndex = Number(btn.dataset.index);
+                    if (!Number.isFinite(targetIndex)) return;
+                    stop();
+                    paused = false;
+                    goTo(targetIndex);
+                    start();
                 });
             });
         }
-
-        root.addEventListener('pointerdown', (event) => {
-            if (event.pointerType === 'mouse' && event.button !== 0) return;
-            startX = event.clientX;
-            lastX = event.clientX;
-            pause();
-            stop();
-            try { root.setPointerCapture(event.pointerId); } catch (_) {}
-        });
-
-        root.addEventListener('pointermove', (event) => {
-            if (startX == null) return;
-            lastX = event.clientX;
-        });
-
-        const handlePointerEnd = () => {
-            if (startX == null || lastX == null) return;
-            const delta = lastX - startX;
-            startX = null;
-            lastX = null;
-
-            if (Math.abs(delta) > 55) {
-                goTo(delta < 0 ? index + 1 : index - 1);
-            }
-
-            resume();
-            start();
-        };
-
-        root.addEventListener('pointerup', handlePointerEnd);
-        root.addEventListener('pointercancel', handlePointerEnd);
-
-        root.addEventListener('mouseenter', pause);
-        root.addEventListener('mouseleave', resume);
-        root.addEventListener('focusin', pause);
-        root.addEventListener('focusout', resume);
 
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
@@ -1161,6 +1692,12 @@ class AppController {
         if (view) {
             view.style.display = 'block';
             this.currentView = viewName;
+            if (isAuthed && viewName !== 'landing') {
+                try {
+                    window.localStorage.setItem('agrilovers.lastView', viewName);
+                } catch (_) {
+                }
+            }
 
             // Update URL
             if (updateHistory) {
@@ -1220,6 +1757,11 @@ class AppController {
 
         // Reuse getPosts but filter for images
         try {
+            if (!this.postsManager || !this.postsManager.supabase) {
+                this.renderPreviewContentForView('showcase');
+                return;
+            }
+
             const posts = await this.withTimeout(this.postsManager.getPosts({ limit: 50 }), 12000); // Fetch more to find images
             const imagePosts = posts.filter(p => p.image_urls && p.image_urls.length > 0);
             
@@ -1234,19 +1776,79 @@ class AppController {
                 return;
             }
 
-            container.innerHTML = imagePosts.map(post => `
-                <div class="card showcase-card" onclick="App.openPostModal('${post.id}')">
-                    <img src="${post.image_urls[0]}" class="showcase-image">
-                    <div class="showcase-meta">
-                        <div class="showcase-author">${this.escapeHtml(post.author.first_name)}</div>
-                        <div class="showcase-likes">❤️ ${post.likes_count}</div>
+            container.innerHTML = imagePosts.map(post => {
+                const author = post.author || {};
+                const authorName = `${author.first_name || ''} ${author.last_name || ''}`.trim() || 'Farmer';
+                const safeImage = this.safeUrl(post.image_urls?.[0]);
+                if (!safeImage) return '';
+                return `
+                    <div class="card showcase-card" onclick="App.openPostModal(${this.jsString(post.id)})">
+                        <img src="${safeImage}" class="showcase-image" alt="${this.escapeHtml(authorName)}" loading="lazy" decoding="async">
+                        <div class="showcase-meta">
+                            <div class="showcase-author">${this.escapeHtml(authorName)}</div>
+                            <div class="showcase-likes">❤️ ${Number(post.likes_count || 0)}</div>
+                        </div>
                     </div>
-                </div>
-            `).join('');
+                `;
+            }).join('');
 
         } catch (error) {
             console.error('Showcase error:', error);
-            container.innerHTML = '<p>Failed to load showcase.</p>';
+            this.renderSupabaseError(container, '📷', 'Could not load showcase', error, 'grid-column: 1/-1;');
+        }
+    }
+
+    async openPostModal(postId) {
+        const contentEl = document.getElementById('postModalContent');
+        const titleEl = document.getElementById('postModalTitle');
+
+        if (titleEl) titleEl.textContent = 'Post Details';
+        if (contentEl) contentEl.innerHTML = '<div class="spinner"></div>';
+        this.openModal('postModal');
+
+        if (!this.postsManager || typeof this.postsManager.getPostById !== 'function') {
+            if (contentEl) {
+                contentEl.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">📄</div>
+                        <h3 class="empty-state-title">Post unavailable</h3>
+                        <p class="empty-state-text">Connect Supabase to view post details.</p>
+                    </div>
+                `;
+            }
+            return;
+        }
+
+        try {
+            const post = await this.withTimeout(this.postsManager.getPostById(postId), 12000);
+            if (!post) {
+                if (contentEl) {
+                    contentEl.innerHTML = `
+                        <div class="empty-state">
+                            <div class="empty-state-icon">📄</div>
+                            <h3 class="empty-state-title">Post not found</h3>
+                            <p class="empty-state-text">It may have been deleted or is unavailable.</p>
+                        </div>
+                    `;
+                }
+                return;
+            }
+
+            const author = post.author || {};
+            const authorName = `${author.first_name || ''} ${author.last_name || ''}`.trim();
+            if (titleEl) titleEl.textContent = authorName ? `Post by ${authorName}` : 'Post Details';
+            if (contentEl) contentEl.innerHTML = this.renderPost(post);
+        } catch (error) {
+            console.error('Open post modal error:', error);
+            if (contentEl) {
+                contentEl.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">⚠️</div>
+                        <h3 class="empty-state-title">Could not load post</h3>
+                        <p class="empty-state-text">Please try again in a moment.</p>
+                    </div>
+                `;
+            }
         }
     }
 
@@ -1256,12 +1858,7 @@ class AppController {
         const previewContainer = document.getElementById('previewModeContainer');
         if (previewContainer && previewContainer.style.display !== 'none') {
             console.warn('Preview mode active, skipping data load');
-            const isSupabaseConfigured = SUPABASE_CONFIG.url &&
-                                        SUPABASE_CONFIG.url !== 'YOUR_SUPABASE_URL' &&
-                                        SUPABASE_CONFIG.anonKey &&
-                                        SUPABASE_CONFIG.anonKey !== 'YOUR_SUPABASE_ANON_KEY';
-
-            if (!isSupabaseConfigured) {
+            if (!this.isSupabaseConfigured()) {
                 this.renderPreviewContentForView(viewName);
                 return;
             }
@@ -1321,7 +1918,7 @@ class AppController {
             this.renderPosts(filteredPosts);
         } catch (error) {
             console.error('Load feed error:', error);
-            container.innerHTML = '<div class="empty-state"><p>Failed to load posts. Please check your Supabase configuration.</p></div>';
+            this.renderSupabaseError(container, '🏠', 'Could not load feed', error);
         }
     }
 
@@ -1368,8 +1965,8 @@ class AppController {
     // Render a single post
     renderPost(post) {
         const author = post.author || {};
-        const avatar = author.avatar_url || this.getInitials(author.first_name, author.last_name);
         const authorName = `${author.first_name || ''} ${author.last_name || ''}`.trim() || 'Unknown';
+        const avatarHtml = this.renderAvatarHtml(author.avatar_url, author.first_name, author.last_name, authorName);
         const location = post.location_district ? `${post.location_district}, ${post.location_province}` : post.location_province || '';
         const timeAgo = this.formatTimeAgo(post.created_at);
         const likesCount = post.likes_count || 0;
@@ -1381,7 +1978,7 @@ class AppController {
         return `
             <div class="post-card" data-post-id="${post.id}">
                 <div class="post-header">
-                    <div class="post-avatar">${avatar}</div>
+                    <div class="post-avatar">${avatarHtml}</div>
                     <div class="flex-1">
                         <h4>${this.escapeHtml(authorName)}</h4>
                         <div class="post-meta">
@@ -1399,7 +1996,11 @@ class AppController {
                     <div class="post-images-grid">
                         ${post.image_urls.map(url => `
                             <div class="post-image-container">
-                                <img src="${url}" class="post-image" onclick="window.open('${url}', '_blank')">
+                                ${(() => {
+                                    const safe = this.safeUrl(url);
+                                    if (!safe) return '';
+                                    return `<a class="post-image-link" href="${safe}" target="_blank" rel="noopener noreferrer"><img src="${safe}" class="post-image" loading="lazy" decoding="async"></a>`;
+                                })()}
                             </div>
                         `).join('')}
                     </div>
@@ -1444,6 +2045,8 @@ class AppController {
 
         if (!files || files.length === 0) return;
 
+        const allowed = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif']);
+
         // Limit to 4 images
         if (files.length > 4) {
             this.showAlert('Maximum 4 images allowed', 'error');
@@ -1451,22 +2054,30 @@ class AppController {
             return;
         }
 
-        Array.from(files).forEach(file => {
-            if (!file.type.startsWith('image/')) return;
-            
-            // Basic validation (5MB limit)
-            if (file.size > 5 * 1024 * 1024) {
-                this.showAlert(`Image ${file.name} is too large (max 5MB)`, 'error');
-                return;
-            }
+        const selectedFiles = Array.from(files);
+        if (selectedFiles.some((file) => !file || !allowed.has(file.type))) {
+            this.showAlert('Only PNG, JPG, WebP, or GIF images are allowed', 'error');
+            event.target.value = '';
+            return;
+        }
 
+        if (selectedFiles.some((file) => file.size > 5 * 1024 * 1024)) {
+            this.showAlert('Each image must be 5MB or smaller', 'error');
+            event.target.value = '';
+            return;
+        }
+
+        selectedFiles.forEach(file => {
             const reader = new FileReader();
             reader.onload = (e) => {
                 const div = document.createElement('div');
                 div.style.cssText = 'position: relative; width: 80px; height: 80px; border-radius: 8px; overflow: hidden;';
-                div.innerHTML = `
-                    <img src="${e.target.result}" class="image-cover">
-                `;
+                const img = document.createElement('img');
+                img.className = 'image-cover';
+                img.src = String(e?.target?.result || '');
+                img.loading = 'lazy';
+                img.decoding = 'async';
+                div.appendChild(img);
                 previewContainer.appendChild(div);
             };
             reader.readAsDataURL(file);
@@ -1490,6 +2101,23 @@ class AppController {
         if (!content && imageFiles.length === 0) {
             this.showAlert('Please enter post content or add an image', 'error');
             return;
+        }
+
+        if (imageFiles && imageFiles.length) {
+            const allowed = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp', 'image/gif']);
+            const selectedFiles = Array.from(imageFiles);
+            if (selectedFiles.length > 4) {
+                this.showAlert('Maximum 4 images allowed', 'error');
+                return;
+            }
+            if (selectedFiles.some((file) => !file || !allowed.has(file.type))) {
+                this.showAlert('Only PNG, JPG, WebP, or GIF images are allowed', 'error');
+                return;
+            }
+            if (selectedFiles.some((file) => file.size > 5 * 1024 * 1024)) {
+                this.showAlert('Each image must be 5MB or smaller', 'error');
+                return;
+            }
         }
 
         try {
@@ -1596,19 +2224,73 @@ class AppController {
 
         container.innerHTML = comments.map(comment => {
             const author = comment.author || {};
-            const avatar = author.avatar_url || this.getInitials(author.first_name, author.last_name);
             const authorName = `${author.first_name || ''} ${author.last_name || ''}`.trim() || 'Unknown';
+            const avatarHtml = this.renderAvatarHtml(author.avatar_url, author.first_name, author.last_name, authorName);
+            const likesCount = Number(comment.likes_count) || 0;
+            const liked = comment.user_liked ? 'liked' : '';
             
             return `
                 <div class="comment">
-                    <div class="comment-avatar">${avatar}</div>
+                    <div class="comment-avatar">${avatarHtml}</div>
                     <div class="comment-content">
                         <div class="comment-author">${this.escapeHtml(authorName)}</div>
                         <div class="comment-text">${this.escapeHtml(comment.content)}</div>
+                        <div class="comment-actions">
+                            <button class="comment-action ${liked}" type="button" onclick="App.toggleCommentLike('${postId}', '${comment.id}')">
+                                ${liked ? '❤️' : '🤍'} ${likesCount}
+                            </button>
+                        </div>
                     </div>
                 </div>
             `;
         }).join('');
+    }
+
+    async toggleCommentLike(postId, commentId) {
+        if (!this.authManager || !this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        if (!this.postsManager || !this.postsManager.likeComment) {
+            this.showAlert('Comment likes unavailable', 'error');
+            return;
+        }
+
+        const btn = document.querySelector(`#comments-list-${postId} .comment-action[onclick*="${commentId}"]`);
+        if (!btn) return;
+
+        const isLiked = btn.classList.contains('liked');
+        let count = parseInt(String(btn.textContent || '').trim().split(' ').pop() || '0', 10);
+        if (!Number.isFinite(count)) count = 0;
+
+        if (isLiked) {
+            btn.classList.remove('liked');
+            count = Math.max(0, count - 1);
+            btn.innerHTML = `🤍 ${count}`;
+        } else {
+            btn.classList.add('liked');
+            count += 1;
+            btn.innerHTML = `❤️ ${count}`;
+        }
+
+        try {
+            if (isLiked) {
+                await this.postsManager.unlikeComment(commentId);
+            } else {
+                await this.postsManager.likeComment(commentId);
+            }
+        } catch (error) {
+            console.error('Comment like error:', error);
+            if (isLiked) {
+                btn.classList.add('liked');
+                btn.innerHTML = `❤️ ${count + 1}`;
+            } else {
+                btn.classList.remove('liked');
+                btn.innerHTML = `🤍 ${Math.max(0, count - 1)}`;
+            }
+            this.showAlert('Failed to update comment like', 'error');
+        }
     }
 
     // Add comment
@@ -1676,7 +2358,7 @@ class AppController {
             this.renderMarketPosts(posts);
         } catch (error) {
             console.error('Load market posts error:', error);
-            container.innerHTML = '<div class="empty-state"><p>Failed to load market listings. Please check your Supabase configuration.</p></div>';
+            this.renderSupabaseError(container, '💰', 'Could not load market listings', error);
         }
     }
 
@@ -1719,7 +2401,7 @@ class AppController {
             this.renderPriceReports(reports);
         } catch (error) {
             console.error('Load price reports error:', error);
-            container.innerHTML = '<div class="empty-state"><p>Failed to load price reports. Please check your Supabase configuration.</p></div>';
+            this.renderSupabaseError(container, '📈', 'Could not load price reports', error);
         }
     }
 
@@ -1978,7 +2660,7 @@ class AppController {
             this.renderGroups(groups);
         } catch (error) {
             console.error('Load groups error:', error);
-            container.innerHTML = '<div class="empty-state"><p>Failed to load groups. Please check your Supabase configuration.</p></div>';
+            this.renderSupabaseError(container, '👥', 'Could not load groups', error, 'grid-column: 1/-1;');
         }
     }
 
@@ -2000,6 +2682,25 @@ class AppController {
         container.innerHTML = groups.map(group => {
             const membersCount = group.members_count || 0;
             const isMember = group.is_member;
+            const isPublic = group.is_public !== false;
+            const joinRequestStatus = group.join_request_status || null;
+            const canReviewRequests = !isPublic && (group.user_role === 'admin' || group.user_role === 'moderator');
+
+            let primaryLabel = 'Join Group';
+            let primaryAction = 'joinGroup';
+            let primaryDisabled = false;
+
+            if (isMember) {
+                primaryLabel = 'Leave Group';
+                primaryAction = 'leaveGroup';
+            } else if (!isPublic) {
+                if (joinRequestStatus === 'pending') {
+                    primaryLabel = 'Request Pending';
+                    primaryDisabled = true;
+                } else {
+                    primaryLabel = 'Request to Join';
+                }
+            }
             
             return `
                 <div class="card group-card">
@@ -2011,16 +2712,28 @@ class AppController {
                         <span class="badge">${this.escapeHtml(group.group_type)}</span>
                         ${group.crop_tag ? `<span class="badge">${this.escapeHtml(group.crop_tag)}</span>` : ''}
                         ${group.province ? `<span class="badge">${this.escapeHtml(group.province)}</span>` : ''}
+                        ${!isPublic ? `<span class="badge">Private</span>` : ''}
                     </div>
                     <div class="post-meta group-meta">
                         👥 ${membersCount} members
                     </div>
                     <button 
-                        class="btn ${isMember ? 'btn-outline' : 'btn-primary'} btn-full-width" 
-                        onclick="App.${isMember ? 'leaveGroup' : 'joinGroup'}('${group.id}')"
+                        class="btn ${isMember ? 'btn-outline' : 'btn-primary'} btn-full-width"
+                        ${primaryDisabled ? 'disabled' : ''}
+                        onclick="App.${primaryAction}('${group.id}')"
                     >
-                        ${isMember ? 'Leave Group' : 'Join Group'}
+                        ${primaryLabel}
                     </button>
+                    ${joinRequestStatus === 'pending' && !isMember ? `
+                        <button class="btn btn-outline btn-sm btn-full-width" onclick="App.cancelGroupJoinRequest('${group.id}')">
+                            Cancel Request
+                        </button>
+                    ` : ''}
+                    ${canReviewRequests ? `
+                        <button class="btn btn-outline btn-sm btn-full-width" onclick="App.openJoinRequests('${group.id}')">
+                            Review Requests
+                        </button>
+                    ` : ''}
                 </div>
             `;
         }).join('');
@@ -2034,12 +2747,34 @@ class AppController {
         }
 
         try {
-            await this.groupsManager.joinGroup(groupId);
-            this.showAlert('Joined group successfully!', 'success');
+            const result = await this.groupsManager.joinGroup(groupId);
+            if (result?.alreadyMember) {
+                this.showAlert('You are already a member of this group.', 'success');
+            } else if (result?.requested) {
+                this.showAlert('Request sent. Waiting for admin approval.', 'success');
+            } else {
+                this.showAlert('Joined group successfully!', 'success');
+            }
             await this.loadGroups();
         } catch (error) {
             console.error('Join group error:', error);
             this.showAlert('Failed to join group', 'error');
+        }
+    }
+
+    async cancelGroupJoinRequest(groupId) {
+        if (!this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        try {
+            await this.groupsManager.cancelJoinRequest(groupId);
+            this.showAlert('Request cancelled', 'success');
+            await this.loadGroups();
+        } catch (error) {
+            console.error('Cancel join request error:', error);
+            this.showAlert('Failed to cancel request', 'error');
         }
     }
 
@@ -2051,6 +2786,96 @@ class AppController {
             await this.loadGroups();
         } catch (error) {
             console.error('Leave group error:', error);
+        }
+    }
+
+    async openJoinRequests(groupId) {
+        if (!this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        const container = document.getElementById('joinRequestsContainer');
+        if (container) container.innerHTML = '<div class="spinner"></div>';
+        this.openModal('joinRequestsModal');
+
+        try {
+            const requests = await this.groupsManager.getPendingJoinRequests(groupId);
+            this.renderJoinRequests(groupId, requests);
+        } catch (error) {
+            console.error('Load join requests error:', error);
+            if (container) {
+                container.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">👥</div>
+                        <h3 class="empty-state-title">Could not load requests</h3>
+                        <p class="empty-state-text">Please try again.</p>
+                    </div>
+                `;
+            }
+        }
+    }
+
+    renderJoinRequests(groupId, requests) {
+        const container = document.getElementById('joinRequestsContainer');
+        if (!container) return;
+
+        if (!requests || requests.length === 0) {
+            container.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">✅</div>
+                    <h3 class="empty-state-title">No pending requests</h3>
+                    <p class="empty-state-text">New requests will show up here.</p>
+                </div>
+            `;
+            return;
+        }
+
+        container.innerHTML = requests.map((req) => {
+            const name = `${req.user?.first_name || ''} ${req.user?.last_name || ''}`.trim() || 'Farmer';
+            const locationParts = [];
+            if (req.user?.district) locationParts.push(req.user.district);
+            if (req.user?.province) locationParts.push(req.user.province);
+            const location = locationParts.join(', ');
+            const timeAgo = this.formatTimeAgo(req.requested_at);
+
+            return `
+                <div class="card" style="margin-bottom: var(--spacing-sm);">
+                    <div style="display: flex; justify-content: space-between; gap: var(--spacing-sm);">
+                        <div>
+                            <div style="font-weight: 600;">${this.escapeHtml(name)}</div>
+                            <div class="post-meta">${location ? `📍 ${this.escapeHtml(location)} • ` : ''}${timeAgo}</div>
+                        </div>
+                    </div>
+                    <div style="display: flex; gap: var(--spacing-sm); margin-top: var(--spacing-sm);">
+                        <button class="btn btn-primary btn-sm" onclick="App.approveJoinRequest('${groupId}', '${req.id}', '${req.user_id}')">Approve</button>
+                        <button class="btn btn-outline btn-sm" onclick="App.rejectJoinRequest('${groupId}', '${req.id}')">Reject</button>
+                    </div>
+                </div>
+            `;
+        }).join('');
+    }
+
+    async approveJoinRequest(groupId, requestId, userId) {
+        try {
+            await this.groupsManager.approveJoinRequest(requestId, groupId, userId);
+            await this.openJoinRequests(groupId);
+            await this.loadGroups();
+            this.showAlert('Request approved', 'success');
+        } catch (error) {
+            console.error('Approve join request error:', error);
+            this.showAlert('Failed to approve request', 'error');
+        }
+    }
+
+    async rejectJoinRequest(groupId, requestId) {
+        try {
+            await this.groupsManager.rejectJoinRequest(requestId);
+            await this.openJoinRequests(groupId);
+            this.showAlert('Request rejected', 'success');
+        } catch (error) {
+            console.error('Reject join request error:', error);
+            this.showAlert('Failed to reject request', 'error');
         }
     }
 
@@ -2138,53 +2963,118 @@ class AppController {
         }
 
         try {
-            const chats = await this.withTimeout(this.messagingManager.getChats(), 12000);
-            this.renderChats(chats);
+            const [chats, groups] = await Promise.all([
+                this.withTimeout(this.messagingManager.getChats(), 12000),
+                this.withTimeout(this.messagingManager.getGroupChats(), 12000)
+            ]);
+            this.renderChats(chats, groups);
         } catch (error) {
             console.error('Load messages error:', error);
-            container.innerHTML = '<div class="empty-state"><p>Failed to load messages. Please check your Supabase configuration.</p></div>';
+            this.renderSupabaseError(container, '💬', 'Could not load messages', error);
         }
     }
 
     // Render chats list
-    renderChats(chats) {
+    renderChats(chats, groups = []) {
         const container = document.getElementById('chatsContainer');
-        
-        if (!chats || chats.length === 0) {
-            container.innerHTML = `
-                <div class="empty-state">
-                    <div class="empty-state-icon">💬</div>
-                    <h3 class="empty-state-title">No messages yet</h3>
-                    <p class="empty-state-text">Start a conversation with another farmer from the Feed.</p>
-                </div>
-            `;
-            return;
-        }
+        const directChats = Array.isArray(chats) ? chats : [];
+        const groupChats = Array.isArray(groups) ? groups : [];
+        const myId = this.authManager?.getProfile?.()?.id || null;
 
-        container.innerHTML = chats.map(chat => {
+        const directHtml = directChats.length ? directChats.map(chat => {
             const otherUser = chat.other_user || {};
-            const avatar = otherUser.avatar_url || this.getInitials(otherUser.first_name, otherUser.last_name);
             const name = `${otherUser.first_name || ''} ${otherUser.last_name || ''}`.trim() || 'Unknown';
-            const unreadCount = chat.unread_count || 0;
+            const avatarHtml = this.renderAvatarHtml(otherUser.avatar_url, otherUser.first_name, otherUser.last_name, name);
+            const unreadCount = Number(chat.unread_count) || 0;
+            const isUnread = unreadCount > 0;
+            const previewRaw = String(chat.last_message_preview || '').trim();
+            const previewPrefix = myId && chat.last_message_sender_id === myId ? 'You: ' : '';
+            const preview = previewRaw ? `${previewPrefix}${previewRaw}` : 'No messages yet';
+            const timeSource = chat.last_message_created_at || chat.last_message_at || chat.created_at || null;
+            const timeAgo = timeSource ? this.formatTimeAgo(timeSource) : '';
             
             return `
-                <div class="card chat-card" onclick="App.openChat('${chat.id}', ${this.jsString(name)})">
+                <div class="card chat-card ${isUnread ? 'chat-card-unread' : ''}" onclick="App.openChat('${chat.id}', ${this.jsString(name)});" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();App.openChat('${chat.id}', ${this.jsString(name)});}">
                     <div class="chat-card-content">
-                        <div class="post-avatar">${avatar}</div>
+                        <div class="post-avatar">${avatarHtml}</div>
                         <div class="chat-info">
-                            <h4 class="chat-name">${this.escapeHtml(name)}</h4>
-                            ${unreadCount > 0 ? `<span class="badge badge-error">${unreadCount} new</span>` : ''}
+                            <div class="chat-row-top">
+                                <h4 class="chat-name">${this.escapeHtml(name)}</h4>
+                                ${timeAgo ? `<div class="chat-time">${this.escapeHtml(timeAgo)}</div>` : ''}
+                            </div>
+                            <div class="chat-row-bottom">
+                                <div class="chat-preview">${this.escapeHtml(preview)}</div>
+                                ${unreadCount > 0 ? `<span class="badge badge-error chat-unread-badge">${unreadCount}</span>` : ''}
+                            </div>
                         </div>
                     </div>
                 </div>
             `;
-        }).join('');
+        }).join('') : `
+            <div class="empty-state">
+                <div class="empty-state-icon">💬</div>
+                <h3 class="empty-state-title">No direct messages yet</h3>
+                <p class="empty-state-text">Start a conversation with another farmer from the Feed.</p>
+            </div>
+        `;
+
+        const groupHtml = groupChats.length ? groupChats.map(group => {
+            const name = String(group.name || 'Group');
+            const unreadCount = Number(group.unread_count) || 0;
+            const isUnread = unreadCount > 0;
+            const previewRaw = String(group.last_message_preview || '').trim();
+            const previewPrefix = myId && group.last_message_sender_id === myId ? 'You: ' : '';
+            const preview = previewRaw ? `${previewPrefix}${previewRaw}` : 'No messages yet';
+            const timeSource = group.last_message_created_at || null;
+            const timeAgo = timeSource ? this.formatTimeAgo(timeSource) : '';
+            const metaParts = [group.group_type, group.crop_tag || group.province].filter(Boolean);
+            const meta = metaParts.join(' • ');
+            return `
+                <div class="card chat-card ${isUnread ? 'chat-card-unread' : ''}" onclick="App.openGroupChat('${group.id}', ${this.jsString(name)});" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();App.openGroupChat('${group.id}', ${this.jsString(name)});}">
+                    <div class="chat-card-content">
+                        <div class="post-avatar">👥</div>
+                        <div class="chat-info">
+                            <div class="chat-row-top">
+                                <h4 class="chat-name">${this.escapeHtml(name)}</h4>
+                                ${timeAgo ? `<div class="chat-time">${this.escapeHtml(timeAgo)}</div>` : ''}
+                            </div>
+                            <div class="chat-row-bottom">
+                                <div class="chat-preview">${this.escapeHtml(preview)}</div>
+                                ${unreadCount > 0 ? `<span class="badge badge-error chat-unread-badge">${unreadCount}</span>` : ''}
+                            </div>
+                            ${meta ? `<div class="post-meta">${this.escapeHtml(meta)}</div>` : ''}
+                        </div>
+                    </div>
+                </div>
+            `;
+        }).join('') : `
+            <div class="empty-state">
+                <div class="empty-state-icon">👥</div>
+                <h3 class="empty-state-title">No group chats yet</h3>
+                <p class="empty-state-text">Join a group to start chatting with members.</p>
+            </div>
+        `;
+
+        container.innerHTML = `
+            <div class="chat-section">
+                <div class="chat-section-title">Direct</div>
+                ${directHtml}
+            </div>
+            <div class="chat-section">
+                <div class="chat-section-title">Groups</div>
+                ${groupHtml}
+            </div>
+        `;
     }
 
     // Open chat
     async openChat(chatId, userName) {
         const previousChatId = this.currentChatId;
+        const previousGroupId = this.currentGroupId;
+        const previousChatType = this.currentChatType;
         this.currentChatId = chatId;
+        this.currentChatType = 'direct';
+        this.currentGroupId = null;
         document.getElementById('chatTitle').textContent = `💬 ${userName}`;
         this.openModal('chatModal');
 
@@ -2198,7 +3088,8 @@ class AppController {
             await this.messagingManager.markAsRead(chatId);
 
             if (this.currentChatChannel) {
-                if (previousChatId) this.messagingManager.unsubscribeFromMessages(previousChatId);
+                if (previousChatType === 'direct' && previousChatId) this.messagingManager.unsubscribeFromMessages(previousChatId);
+                if (previousChatType === 'group' && previousGroupId) this.messagingManager.unsubscribeFromGroupMessages(previousGroupId);
                 this.currentChatChannel = null;
             }
 
@@ -2213,6 +3104,46 @@ class AppController {
                     <div class="empty-state">
                         <div class="empty-state-icon">💬</div>
                         <h3 class="empty-state-title">Could not load messages</h3>
+                        <p class="empty-state-text">Please try again in a moment.</p>
+                    </div>
+                `;
+            }
+        }
+    }
+
+    async openGroupChat(groupId, groupName) {
+        const previousChatId = this.currentChatId;
+        const previousGroupId = this.currentGroupId;
+        const previousChatType = this.currentChatType;
+        this.currentChatId = null;
+        this.currentChatType = 'group';
+        this.currentGroupId = groupId;
+        document.getElementById('chatTitle').textContent = `👥 ${groupName}`;
+        this.openModal('chatModal');
+
+        const messagesEl = document.getElementById('chatMessages');
+        if (messagesEl) messagesEl.innerHTML = '<div class="spinner"></div>';
+
+        try {
+            const messages = await this.withTimeout(this.messagingManager.getGroupMessages(groupId), 12000);
+            await this.renderChatMessages(messages);
+
+            if (this.currentChatChannel) {
+                if (previousChatType === 'direct' && previousChatId) this.messagingManager.unsubscribeFromMessages(previousChatId);
+                if (previousChatType === 'group' && previousGroupId) this.messagingManager.unsubscribeFromGroupMessages(previousGroupId);
+                this.currentChatChannel = null;
+            }
+
+            this.currentChatChannel = this.messagingManager.subscribeToGroupMessages(groupId, async (message) => {
+                await this.appendChatMessage(message);
+            });
+        } catch (error) {
+            console.error('Open group chat error:', error);
+            if (messagesEl) {
+                messagesEl.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">👥</div>
+                        <h3 class="empty-state-title">Could not load group chat</h3>
                         <p class="empty-state-text">Please try again in a moment.</p>
                     </div>
                 `;
@@ -2237,13 +3168,16 @@ class AppController {
         container.innerHTML = messages.map(msg => {
             const isSent = user && msg.sender_id === user.id;
             const sender = msg.sender || {};
-            const avatar = sender.avatar_url || this.getInitials(sender.first_name, sender.last_name);
+            const senderName = `${sender.first_name || ''} ${sender.last_name || ''}`.trim() || 'Farmer';
+            const avatarHtml = this.renderAvatarHtml(sender.avatar_url, sender.first_name, sender.last_name, senderName);
+            const attachmentsHtml = this.renderMessageAttachments(msg.attachments);
             
             return `
                 <div class="message ${isSent ? 'message-sent' : 'message-received'}">
-                    <div class="comment-avatar">${avatar}</div>
+                    <div class="comment-avatar">${avatarHtml}</div>
                     <div class="message-bubble">
                         <div class="message-text">${this.escapeHtml(msg.content)}</div>
+                        ${attachmentsHtml}
                         <div class="message-time">
                             ${this.formatTimeAgo(msg.created_at)}
                         </div>
@@ -2270,13 +3204,16 @@ class AppController {
         }
         const isSent = user && message.sender_id === user.id;
         const sender = message.sender || {};
-        const avatar = sender.avatar_url || this.getInitials(sender.first_name, sender.last_name);
+        const senderName = `${sender.first_name || ''} ${sender.last_name || ''}`.trim() || 'Farmer';
+        const avatarHtml = this.renderAvatarHtml(sender.avatar_url, sender.first_name, sender.last_name, senderName);
+        const attachmentsHtml = this.renderMessageAttachments(message.attachments);
         
         const messageHtml = `
             <div class="message ${isSent ? 'message-sent' : 'message-received'}">
-                <div class="comment-avatar">${avatar}</div>
+                <div class="comment-avatar">${avatarHtml}</div>
                 <div class="message-bubble">
                     <div class="message-text">${this.escapeHtml(message.content)}</div>
+                    ${attachmentsHtml}
                     <div class="message-time">
                         ${this.formatTimeAgo(message.created_at)}
                     </div>
@@ -2290,16 +3227,26 @@ class AppController {
 
     // Send chat message
     async sendChatMessage() {
-        if (!this.currentChatId) return;
-        
         const input = document.getElementById('chatInput');
+        const attachmentInput = document.getElementById('chatAttachmentInput');
+        const attachmentList = document.getElementById('chatAttachmentList');
         const content = input.value.trim();
-        
-        if (!content) return;
+        const files = Array.from(attachmentInput?.files || []);
+
+        if (!content && !files.length) return;
 
         try {
-            const message = await this.messagingManager.sendMessage(this.currentChatId, content);
+            let message = null;
+            if (this.currentChatType === 'group' && this.currentGroupId) {
+                message = await this.messagingManager.sendGroupMessage(this.currentGroupId, content, files);
+            } else if (this.currentChatId) {
+                message = await this.messagingManager.sendMessage(this.currentChatId, content, files);
+            } else {
+                return;
+            }
             input.value = '';
+            if (attachmentInput) attachmentInput.value = '';
+            if (attachmentList) attachmentList.innerHTML = '';
             await this.appendChatMessage(message);
             await this.loadMessages(); // Refresh chat list
         } catch (error) {
@@ -2374,7 +3321,7 @@ class AppController {
 
             resultsEl.innerHTML = filtered.map(farmer => {
                 const name = `${farmer.first_name || ''} ${farmer.last_name || ''}`.trim() || 'Unknown';
-                const avatar = farmer.avatar_url || this.getInitials(farmer.first_name, farmer.last_name);
+                const avatarHtml = this.renderAvatarHtml(farmer.avatar_url, farmer.first_name, farmer.last_name, name);
                 const locationParts = [farmer.district, farmer.province].filter(Boolean);
                 const location = locationParts.join(', ');
                 const metaParts = [location, farmer.farmer_type].filter(Boolean);
@@ -2384,9 +3331,9 @@ class AppController {
                 const chips = [crops && `🌿 ${crops}`, livestock && `🐄 ${livestock}`].filter(Boolean).slice(0, 2);
 
                 return `
-                    <div class="card farmer-card" onclick="App.openFarmerProfile('${farmer.id}')">
+                    <div class="card farmer-card" role="button" tabindex="0" onclick="App.openFarmerProfile('${farmer.id}')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();App.openFarmerProfile('${farmer.id}');}">
                         <div class="farmer-card-header">
-                            <div class="post-avatar">${avatar}</div>
+                            <div class="post-avatar">${avatarHtml}</div>
                             <div class="farmer-card-main">
                                 <div class="farmer-card-name">${this.escapeHtml(name)}</div>
                                 <div class="post-meta">${this.escapeHtml(meta)}</div>
@@ -2428,9 +3375,20 @@ class AppController {
         try {
             const farmer = await this.postsManager.getFarmerProfileById(farmerId);
             const name = `${farmer.first_name || ''} ${farmer.last_name || ''}`.trim() || 'Farmer';
-            const avatar = farmer.avatar_url || this.getInitials(farmer.first_name, farmer.last_name);
+            const avatarHtml = this.renderAvatarHtml(farmer.avatar_url, farmer.first_name, farmer.last_name, name);
             const locationParts = [farmer.district, farmer.province].filter(Boolean);
             const location = locationParts.join(', ');
+            const viewerId = this.authManager?.getProfile?.()?.id || null;
+
+            let friendStatus = { status: 'none' };
+            if (viewerId && viewerId !== farmer.id && this.friendsManager) {
+                try {
+                    friendStatus = await this.friendsManager.getFriendStatus(farmer.id);
+                } catch (error) {
+                    console.error('Friend status error:', error);
+                    friendStatus = { status: 'none' };
+                }
+            }
 
             const rows = [
                 farmer.farmer_type ? ['Farmer type', farmer.farmer_type] : null,
@@ -2439,10 +3397,65 @@ class AppController {
                 (farmer.farm_size_ha != null && farmer.farm_size_ha !== '') ? ['Farm size', `${farmer.farm_size_ha} ha`] : null
             ].filter(Boolean);
 
+            let actionsHtml = '';
+            const canMessage = !!this.messagingManager;
+            const showActions = viewerId && viewerId !== farmer.id;
+
+            if (showActions) {
+                const messageBtn = canMessage
+                    ? `<button class="btn btn-primary btn-full-width" type="button" onclick="App.startChatWithFarmer('${farmer.id}', ${this.jsString(name)});">Message</button>`
+                    : '';
+
+                if (friendStatus.status === 'unavailable') {
+                    actionsHtml = `
+                        <div class="farmer-profile-actions">
+                            ${messageBtn}
+                            <button class="btn btn-outline btn-full-width" type="button" disabled>Connections unavailable</button>
+                        </div>
+                    `;
+                } else if (friendStatus.status === 'friends') {
+                    actionsHtml = `
+                        <div class="farmer-profile-actions">
+                            ${messageBtn}
+                            <button class="btn btn-outline btn-full-width" type="button" disabled>Friends</button>
+                        </div>
+                    `;
+                } else if (friendStatus.status === 'outgoing') {
+                    actionsHtml = `
+                        <div class="farmer-profile-actions">
+                            ${messageBtn}
+                            <button class="btn btn-outline btn-full-width" type="button" disabled>Request sent</button>
+                            <button class="btn btn-outline btn-full-width" type="button" onclick="App.cancelFriendRequest('${farmer.id}')">Cancel request</button>
+                        </div>
+                    `;
+                } else if (friendStatus.status === 'incoming') {
+                    actionsHtml = `
+                        <div class="farmer-profile-actions">
+                            ${messageBtn}
+                            <button class="btn btn-primary btn-full-width" type="button" onclick="App.acceptFriendRequest('${friendStatus.requestId}', '${farmer.id}')">Accept</button>
+                            <button class="btn btn-outline btn-full-width" type="button" onclick="App.declineFriendRequest('${friendStatus.requestId}', '${farmer.id}')">Decline</button>
+                        </div>
+                    `;
+                } else {
+                    actionsHtml = `
+                        <div class="farmer-profile-actions">
+                            ${messageBtn}
+                            <button class="btn btn-primary btn-full-width" type="button" onclick="App.sendFriendRequest('${farmer.id}')">Add Friend</button>
+                        </div>
+                    `;
+                }
+            } else if (canMessage) {
+                actionsHtml = `
+                    <div class="farmer-profile-actions">
+                        <button class="btn btn-primary btn-full-width" type="button" onclick="App.startChatWithFarmer('${farmer.id}', ${this.jsString(name)});">Message</button>
+                    </div>
+                `;
+            }
+
             content.innerHTML = `
                 <div class="farmer-profile">
                     <div class="farmer-profile-header">
-                        <div class="farmer-profile-avatar">${avatar}</div>
+                        <div class="farmer-profile-avatar">${avatarHtml}</div>
                         <div class="farmer-profile-main">
                             <div class="farmer-profile-name">${this.escapeHtml(name)}</div>
                             <div class="post-meta">${this.escapeHtml(location)}</div>
@@ -2459,16 +3472,317 @@ class AppController {
                             `).join('')}
                         </div>
                     ` : ''}
-                    ${this.messagingManager ? `
-                        <div class="farmer-profile-actions">
-                            <button class="btn btn-primary btn-full-width" onclick="App.startChatWithFarmer('${farmer.id}', ${this.jsString(name)});">Message</button>
-                        </div>
-                    ` : ''}
+                    ${actionsHtml}
                 </div>
             `;
         } catch (error) {
             console.error('Open farmer profile error:', error);
             content.innerHTML = '<div class="empty-state"><p>Failed to load farmer profile.</p></div>';
+        }
+    }
+
+    // Friend System & Connections
+    async openConnectionsModal(tab = 'friends') {
+        if (!this.authManager || !this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        this.openModal('connectionsModal');
+        await this.switchConnectionsTab(tab);
+    }
+
+    async switchConnectionsTab(tab) {
+        const modal = document.getElementById('connectionsModal');
+        if (!modal) return;
+
+        // Update tabs
+        const tabs = modal.querySelectorAll('.tab-btn');
+        tabs.forEach(t => {
+            t.classList.toggle('active', t.getAttribute('onclick').includes(tab));
+        });
+
+        const content = document.getElementById('connectionsContent');
+        if (content) content.innerHTML = '<div class="spinner"></div>';
+
+        try {
+            if (tab === 'friends') {
+                const friends = await this.friendsManager.getFriends();
+                this.renderFriendsList(friends);
+            } else if (tab === 'requests') {
+                const [incoming, outgoing] = await Promise.all([
+                    this.friendsManager.getPendingRequests(),
+                    this.friendsManager.getSentRequests()
+                ]);
+                this.renderFriendRequests(incoming, outgoing);
+            } else if (tab === 'suggestions') {
+                const suggestions = await this.friendsManager.getFriendSuggestions();
+                this.renderFriendSuggestions(suggestions);
+            }
+        } catch (error) {
+            console.error('Load connections error:', error);
+            if (content) content.innerHTML = '<div class="empty-state"><p>Failed to load content</p></div>';
+        }
+    }
+
+    renderFriendsList(friends) {
+        const content = document.getElementById('connectionsContent');
+        if (!content) return;
+
+        if (!friends || friends.length === 0) {
+            content.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">👥</div>
+                    <h3 class="empty-state-title">No friends yet</h3>
+                    <p class="empty-state-text">Connect with other farmers to share knowledge and opportunities.</p>
+                    <button class="btn btn-primary" onclick="App.switchConnectionsTab('suggestions')">Find Farmers</button>
+                </div>
+            `;
+            return;
+        }
+
+        content.innerHTML = `
+            <div class="list-group">
+                ${friends.map(friend => `
+                    <div class="list-item">
+                        <div class="comment-avatar" onclick="App.openFarmerProfile('${friend.id}')">
+                            ${this.renderAvatarHtml(friend.avatar_url, friend.first_name, friend.last_name)}
+                        </div>
+                        <div class="list-content" onclick="App.openFarmerProfile('${friend.id}')">
+                            <div class="list-title">${this.escapeHtml(friend.first_name)} ${this.escapeHtml(friend.last_name)}</div>
+                            <div class="list-subtitle">
+                                ${friend.district ? `📍 ${this.escapeHtml(friend.district)}` : ''}
+                                ${friend.farmer_type ? `• ${this.escapeHtml(friend.farmer_type)}` : ''}
+                            </div>
+                        </div>
+                        <div class="list-actions">
+                            <button class="btn btn-icon" onclick="App.startChatWithFarmer('${friend.id}', '${this.jsString(friend.first_name + ' ' + friend.last_name)}')" title="Message">
+                                💬
+                            </button>
+                            <button class="btn btn-icon" onclick="App.confirmRemoveFriend('${friend.friend_id || friend.id}', '${this.jsString(friend.first_name)}')" title="Remove Friend" style="color: var(--danger);">
+                                ✕
+                            </button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    renderFriendRequests(incoming, outgoing) {
+        const content = document.getElementById('connectionsContent');
+        if (!content) return;
+
+        if ((!incoming || incoming.length === 0) && (!outgoing || outgoing.length === 0)) {
+            content.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">📨</div>
+                    <h3 class="empty-state-title">No pending requests</h3>
+                    <p class="empty-state-text">Friend requests you send or receive will appear here.</p>
+                </div>
+            `;
+            return;
+        }
+
+        let html = '';
+
+        if (incoming && incoming.length > 0) {
+            html += `
+                <h4 class="section-title">Incoming Requests</h4>
+                <div class="list-group">
+                    ${incoming.map(req => `
+                        <div class="list-item">
+                            <div class="comment-avatar" onclick="App.openFarmerProfile('${req.requester.id}')">
+                                ${this.renderAvatarHtml(req.requester.avatar_url, req.requester.first_name, req.requester.last_name)}
+                            </div>
+                            <div class="list-content" onclick="App.openFarmerProfile('${req.requester.id}')">
+                                <div class="list-title">${this.escapeHtml(req.requester.first_name)} ${this.escapeHtml(req.requester.last_name)}</div>
+                                <div class="list-subtitle">
+                                    ${req.requester.district ? `📍 ${this.escapeHtml(req.requester.district)}` : ''}
+                                </div>
+                            </div>
+                            <div class="list-actions">
+                                <button class="btn btn-primary btn-sm" onclick="App.acceptFriendRequest('${req.id}', '${req.requester.id}')">Accept</button>
+                                <button class="btn btn-outline btn-sm" onclick="App.declineFriendRequest('${req.id}', '${req.requester.id}')">Decline</button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        if (outgoing && outgoing.length > 0) {
+            html += `
+                <h4 class="section-title" style="margin-top: var(--spacing-md);">Sent Requests</h4>
+                <div class="list-group">
+                    ${outgoing.map(req => `
+                        <div class="list-item">
+                            <div class="comment-avatar" onclick="App.openFarmerProfile('${req.receiver.id}')">
+                                ${this.renderAvatarHtml(req.receiver.avatar_url, req.receiver.first_name, req.receiver.last_name)}
+                            </div>
+                            <div class="list-content" onclick="App.openFarmerProfile('${req.receiver.id}')">
+                                <div class="list-title">${this.escapeHtml(req.receiver.first_name)} ${this.escapeHtml(req.receiver.last_name)}</div>
+                                <div class="list-subtitle">Pending...</div>
+                            </div>
+                            <div class="list-actions">
+                                <button class="btn btn-outline btn-sm" onclick="App.cancelFriendRequest('${req.receiver.id}')">Cancel</button>
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+        }
+
+        content.innerHTML = html;
+    }
+
+    renderFriendSuggestions(suggestions) {
+        const content = document.getElementById('connectionsContent');
+        if (!content) return;
+
+        if (!suggestions || suggestions.length === 0) {
+            content.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">🔍</div>
+                    <h3 class="empty-state-title">No suggestions found</h3>
+                    <p class="empty-state-text">Try updating your profile with your location and crops to get better suggestions.</p>
+                </div>
+            `;
+            return;
+        }
+
+        content.innerHTML = `
+            <div class="list-group">
+                ${suggestions.map(person => `
+                    <div class="list-item">
+                        <div class="comment-avatar" onclick="App.openFarmerProfile('${person.id}')">
+                            ${this.renderAvatarHtml(person.avatar_url, person.first_name, person.last_name)}
+                        </div>
+                        <div class="list-content" onclick="App.openFarmerProfile('${person.id}')">
+                            <div class="list-title">${this.escapeHtml(person.first_name)} ${this.escapeHtml(person.last_name)}</div>
+                            <div class="list-subtitle">
+                                ${person.district ? `📍 ${this.escapeHtml(person.district)}` : ''}
+                                ${person.farmer_type ? `• ${this.escapeHtml(person.farmer_type)}` : ''}
+                            </div>
+                        </div>
+                        <div class="list-actions">
+                            <button class="btn btn-primary btn-sm" onclick="App.sendFriendRequest('${person.id}')">Connect</button>
+                        </div>
+                    </div>
+                `).join('')}
+            </div>
+        `;
+    }
+
+    async confirmRemoveFriend(friendId, name) {
+        if (confirm(`Remove ${name} from your connections?`)) {
+            try {
+                this.showLoading(true);
+                await this.friendsManager.removeFriend(friendId);
+                this.showToast('Connection removed');
+                this.switchConnectionsTab('friends');
+            } catch (error) {
+                console.error('Remove friend error:', error);
+                this.showToast('Failed to remove connection', 'error');
+            } finally {
+                this.showLoading(false);
+            }
+        }
+    }
+
+    async sendFriendRequest(farmerId) {
+        if (!this.authManager || !this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        try {
+            this.showLoading(true);
+            await this.friendsManager.sendFriendRequest(farmerId);
+            this.showToast('Friend request sent', 'success');
+            
+            if (document.getElementById('connectionsModal').classList.contains('active')) {
+                this.switchConnectionsTab('suggestions');
+            } else {
+                await this.openFarmerProfile(farmerId);
+            }
+        } catch (error) {
+            console.error('Send friend request error:', error);
+            this.showToast('Failed to send friend request', 'error');
+        } finally {
+            this.showLoading(false);
+        }
+    }
+
+    async cancelFriendRequest(farmerId) {
+        if (!this.authManager || !this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        try {
+            this.showLoading(true);
+            await this.friendsManager.cancelFriendRequest(farmerId);
+            this.showToast('Request canceled', 'success');
+            
+            if (document.getElementById('connectionsModal').classList.contains('active')) {
+                this.switchConnectionsTab('requests');
+            } else {
+                await this.openFarmerProfile(farmerId);
+            }
+        } catch (error) {
+            console.error('Cancel friend request error:', error);
+            this.showToast('Failed to cancel request', 'error');
+        } finally {
+            this.showLoading(false);
+        }
+    }
+
+    async acceptFriendRequest(requestId, farmerId) {
+        if (!this.authManager || !this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        try {
+            this.showLoading(true);
+            await this.friendsManager.respondToFriendRequest(requestId, 'accepted');
+            this.showToast('Friend request accepted', 'success');
+            
+            if (document.getElementById('connectionsModal').classList.contains('active')) {
+                this.switchConnectionsTab('requests');
+            } else {
+                await this.openFarmerProfile(farmerId);
+            }
+        } catch (error) {
+            console.error('Accept friend request error:', error);
+            this.showToast('Failed to accept request', 'error');
+        } finally {
+            this.showLoading(false);
+        }
+    }
+
+    async declineFriendRequest(requestId, farmerId) {
+        if (!this.authManager || !this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        try {
+            this.showLoading(true);
+            await this.friendsManager.respondToFriendRequest(requestId, 'declined');
+            this.showToast('Friend request declined', 'success');
+            
+            if (document.getElementById('connectionsModal').classList.contains('active')) {
+                this.switchConnectionsTab('requests');
+            } else {
+                await this.openFarmerProfile(farmerId);
+            }
+        } catch (error) {
+            console.error('Decline friend request error:', error);
+            this.showToast('Failed to decline request', 'error');
+        } finally {
+            this.showLoading(false);
         }
     }
 
@@ -2524,7 +3838,13 @@ class AppController {
                 } else {
                     this.closeModal('authModal');
                     this.showAlert('Logged in successfully!', 'success');
-                    await this.loadViewData(this.currentView);
+                    if (this.currentView === 'landing') {
+                        const nextView = this.postLoginRedirect || 'feed';
+                        this.postLoginRedirect = null;
+                        this.switchView(nextView);
+                    } else {
+                        await this.loadViewData(this.currentView);
+                    }
                 }
             } else {
                 this.showAlert(result.error || 'Invalid OTP', 'error');
@@ -2703,7 +4023,13 @@ class AppController {
                 this.openModal('profileModal');
             } else {
                 this.showAlert('Logged in successfully!', 'success');
-                await this.loadViewData(this.currentView);
+                if (this.currentView === 'landing') {
+                    const nextView = this.postLoginRedirect || 'feed';
+                    this.postLoginRedirect = null;
+                    this.switchView(nextView);
+                } else {
+                    await this.loadViewData(this.currentView);
+                }
             }
         } catch (error) {
             console.error('Password login error:', error);
@@ -2715,12 +4041,135 @@ class AppController {
 
     // Open modal
     openModal(modalId) {
-        document.getElementById(modalId).classList.add('active');
+        const modal = document.getElementById(modalId);
+        if (!modal) return;
+
+        const previousFocus = (document.activeElement && document.activeElement instanceof HTMLElement)
+            ? document.activeElement
+            : null;
+
+        modal.classList.add('active');
+        this.modalStack.push({ modalId, previousFocus });
+        this.activeModalId = modalId;
+
+        window.setTimeout(() => {
+            const closeBtn = modal.querySelector('.modal-close');
+            const focusables = this.getModalFocusableElements(modal);
+            const target = focusables[0] || closeBtn;
+            if (target && typeof target.focus === 'function') target.focus();
+        }, 0);
     }
 
     // Close modal
     closeModal(modalId) {
-        document.getElementById(modalId).classList.remove('active');
+        const modal = document.getElementById(modalId);
+        if (!modal) return;
+
+        modal.classList.remove('active');
+
+        let restoreFocus = null;
+        for (let i = this.modalStack.length - 1; i >= 0; i--) {
+            const entry = this.modalStack[i];
+            if (entry.modalId === modalId) {
+                restoreFocus = entry.previousFocus || null;
+                this.modalStack.splice(i, 1);
+                break;
+            }
+        }
+
+        this.activeModalId = this.modalStack.length ? this.modalStack[this.modalStack.length - 1].modalId : null;
+
+        if (modalId === 'chatModal') {
+            if (this.currentChatChannel) {
+                if (this.currentChatType === 'direct' && this.currentChatId) {
+                    this.messagingManager?.unsubscribeFromMessages?.(this.currentChatId);
+                }
+                if (this.currentChatType === 'group' && this.currentGroupId) {
+                    this.messagingManager?.unsubscribeFromGroupMessages?.(this.currentGroupId);
+                }
+                this.currentChatChannel = null;
+            }
+            this.currentChatId = null;
+            this.currentGroupId = null;
+            this.currentChatType = 'direct';
+            const input = document.getElementById('chatInput');
+            if (input) input.value = '';
+            const attachmentInput = document.getElementById('chatAttachmentInput');
+            if (attachmentInput) attachmentInput.value = '';
+            const attachmentList = document.getElementById('chatAttachmentList');
+            if (attachmentList) attachmentList.innerHTML = '';
+        }
+
+        if (restoreFocus && typeof restoreFocus.focus === 'function') {
+            window.setTimeout(() => restoreFocus.focus(), 0);
+        }
+    }
+
+    setupModalAccessibility() {
+        if (this.modalAccessibilityInitialized) return;
+        this.modalAccessibilityInitialized = true;
+
+        document.addEventListener('keydown', (event) => {
+            const modalId = this.activeModalId;
+            if (!modalId) return;
+            if (modalId === 'loadingOverlay') return;
+
+            const modal = document.getElementById(modalId);
+            if (!modal || !modal.classList.contains('active')) return;
+
+            if (event.key === 'Escape') {
+                event.preventDefault();
+                this.closeModal(modalId);
+                return;
+            }
+
+            if (event.key !== 'Tab') return;
+
+            const focusables = this.getModalFocusableElements(modal);
+            if (!focusables.length) {
+                event.preventDefault();
+                return;
+            }
+
+            const first = focusables[0];
+            const last = focusables[focusables.length - 1];
+            const active = document.activeElement;
+
+            if (event.shiftKey) {
+                if (active === first || !modal.contains(active)) {
+                    event.preventDefault();
+                    last.focus();
+                }
+            } else {
+                if (active === last || !modal.contains(active)) {
+                    event.preventDefault();
+                    first.focus();
+                }
+            }
+        });
+
+        document.addEventListener('click', (event) => {
+            const modalId = this.activeModalId;
+            if (!modalId) return;
+            if (modalId === 'loadingOverlay') return;
+
+            const modal = document.getElementById(modalId);
+            if (!modal || !modal.classList.contains('active')) return;
+            if (event.target === modal) this.closeModal(modalId);
+        });
+    }
+
+    getModalFocusableElements(modal) {
+        const nodes = Array.from(
+            modal.querySelectorAll('a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])')
+        );
+
+        return nodes.filter((el) => {
+            if (!(el instanceof HTMLElement)) return false;
+            const style = window.getComputedStyle(el);
+            if (style.visibility === 'hidden' || style.display === 'none') return false;
+            return true;
+        });
     }
 
     // Show loading overlay
@@ -2749,45 +4198,467 @@ class AppController {
     setupRealtimeSubscriptions() {
         // Subscribe to new posts
         this.postsManager.subscribeToPosts((payload) => {
-            if (this.currentView === 'feed') {
-                this.loadFeed();
+            const postId = payload?.new?.id || null;
+            if (this.currentView === 'feed' && postId) {
+                this.tryInsertNewFeedPost(postId);
             } else {
                 // Optional: Show a small indicator that there are new posts
             }
         });
+        this.setupChatNotificationSubscriptions();
+        this.setupNotificationSubscriptions();
+        this.refreshNotificationsBadge();
+    }
 
-        // Subscribe to global messages (to show notifications)
-        if (this.messagingManager) {
-            this.supabase.channel('global_messages')
-                .on('postgres_changes', 
-                    { event: 'INSERT', schema: 'public', table: 'messages' },
-                    async (payload) => {
-                        // Check if message is for us (not sent by us)
-                        const user = this.authManager.getUser();
-                        if (user && payload.new.sender_id !== user.id) {
-                            if (this.currentView === 'messages') {
-                                // If in messages view, reload list
-                                await this.loadMessages();
-                            } else if (this.currentChatId !== payload.new.chat_id) {
-                                // Show notification if not in this specific chat
-                                this.showAlert('New message received! 💬', 'info');
-                            }
-                        }
-                    }
-                )
-                .subscribe();
+    async tryInsertNewFeedPost(postId) {
+        if (!postId || !this.postsManager || !this.postsManager.supabase) return;
+        const container = document.getElementById('postsContainer');
+        if (!container) return;
+        if (container.querySelector('.spinner')) return;
+        if (container.querySelector(`.post-card[data-post-id="${postId}"]`)) return;
+
+        if (!this.recentRealtimePostIds) this.recentRealtimePostIds = new Set();
+        if (this.recentRealtimePostIds.has(postId)) return;
+        this.recentRealtimePostIds.add(postId);
+        window.setTimeout(() => this.recentRealtimePostIds.delete(postId), 30000);
+
+        try {
+            const post = await this.withTimeout(this.postsManager.getPostById(postId), 12000);
+            if (!post) {
+                this.scheduleFeedReload();
+                return;
+            }
+
+            const filters = this.feedFilters || { province: '', cropTag: '', photosOnly: false };
+            if (filters.province && String(post.location_province || '') !== String(filters.province)) return;
+            if (filters.cropTag && !(Array.isArray(post.crop_tags) && post.crop_tags.includes(filters.cropTag))) return;
+            if (filters.photosOnly && !(Array.isArray(post.image_urls) && post.image_urls.length > 0)) return;
+
+            if (container.querySelector(`.post-card[data-post-id="${post.id}"]`)) return;
+            container.insertAdjacentHTML('afterbegin', this.renderPost(post));
+        } catch (_) {
+            this.scheduleFeedReload();
         }
+    }
+
+    scheduleFeedReload() {
+        if (this.feedReloadTimer) return;
+        this.feedReloadTimer = window.setTimeout(async () => {
+            this.feedReloadTimer = null;
+            if (this.currentView === 'feed') {
+                await this.loadFeed();
+            }
+        }, 1200);
+    }
+
+    setupChatNotificationSubscriptions() {
+        if (!this.messagingManager || !this.supabase || !this.authManager) return;
+
+        const user = this.authManager.getUser();
+        if (!user?.id) return;
+
+        this.teardownChatNotificationSubscriptions();
+
+        const handler = async (payload) => {
+            const chatId = payload?.new?.id || payload?.old?.id || null;
+            if (!chatId) return;
+            if (this.currentChatId && String(this.currentChatId) === String(chatId)) return;
+
+            if (this.currentView === 'messages') {
+                await this.loadMessages();
+                return;
+            }
+
+            this.showAlert('New message received! 💬', 'info');
+        };
+
+        const channelUser1 = this.supabase
+            .channel(`chats_notify_user1:${user.id}`)
+            .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'chats', filter: `user1_id=eq.${user.id}` }, handler)
+            .subscribe();
+
+        const channelUser2 = this.supabase
+            .channel(`chats_notify_user2:${user.id}`)
+            .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'chats', filter: `user2_id=eq.${user.id}` }, handler)
+            .subscribe();
+
+        this.chatNotificationChannels = [channelUser1, channelUser2];
+    }
+
+    teardownChatNotificationSubscriptions() {
+        if (!this.supabase || !this.chatNotificationChannels || this.chatNotificationChannels.length === 0) return;
+        this.chatNotificationChannels.forEach((ch) => {
+            try { this.supabase.removeChannel(ch); } catch (_) {}
+        });
+        this.chatNotificationChannels = [];
+    }
+
+    setupNotificationSubscriptions() {
+        if (!this.supabase || !this.authManager) return;
+        const user = this.authManager.getUser();
+        if (!user?.id) return;
+
+        this.teardownNotificationSubscriptions();
+
+        const handler = async (payload) => {
+            const change = payload?.new || payload?.old || null;
+            if (!change) return;
+
+            if (payload?.eventType === 'INSERT') {
+                if (!change.is_read) {
+                    this.setUnreadNotificationsCount((this.unreadNotificationsCount || 0) + 1);
+                }
+            } else if (payload?.eventType === 'UPDATE') {
+                await this.refreshNotificationsBadge();
+            }
+
+            if (payload?.eventType === 'INSERT') {
+                const title = String(change.title || 'Notification');
+                this.showAlert(title, 'info');
+            }
+
+            const modal = document.getElementById('notificationsModal');
+            if (modal && modal.classList.contains('active')) {
+                await this.loadNotificationsIntoModal();
+            }
+        };
+
+        this.notificationsChannel = this.supabase
+            .channel(`notifications:${user.id}`)
+            .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'notifications', filter: `recipient_id=eq.${user.id}` }, handler)
+            .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'notifications', filter: `recipient_id=eq.${user.id}` }, handler)
+            .subscribe();
+    }
+
+    teardownNotificationSubscriptions() {
+        if (!this.supabase || !this.notificationsChannel) return;
+        try { this.supabase.removeChannel(this.notificationsChannel); } catch (_) {}
+        this.notificationsChannel = null;
+    }
+
+    setUnreadNotificationsCount(count) {
+        const next = Math.max(0, Number(count) || 0);
+        this.unreadNotificationsCount = next;
+        const badge = document.getElementById('notificationsBadge');
+        if (!badge) return;
+        if (!next) {
+            badge.style.display = 'none';
+            badge.textContent = '';
+            return;
+        }
+        badge.style.display = 'inline-flex';
+        badge.textContent = next > 99 ? '99+' : String(next);
+    }
+
+    async refreshNotificationsBadge() {
+        if (!this.supabase || !this.authManager || !this.authManager.isAuthenticated()) return;
+        try {
+            const { count, error } = await this.supabase
+                .from('notifications')
+                .select('id', { count: 'exact', head: true })
+                .eq('is_read', false);
+            if (error) throw error;
+            this.setUnreadNotificationsCount(count || 0);
+        } catch (_) {
+            this.setUnreadNotificationsCount(0);
+        }
+    }
+
+    async openNotificationsModal() {
+        if (!this.authManager || !this.authManager.isAuthenticated()) {
+            this.openAccountModal();
+            return;
+        }
+
+        const content = document.getElementById('notificationsModalContent');
+        if (content) content.innerHTML = '<div class="spinner"></div>';
+        this.openModal('notificationsModal');
+        await this.loadNotificationsIntoModal();
+    }
+
+    async loadNotificationsIntoModal() {
+        if (!this.supabase || !this.authManager || !this.authManager.isAuthenticated()) return;
+        const content = document.getElementById('notificationsModalContent');
+        if (!content) return;
+
+        try {
+            const { data, error } = await this.withTimeout(
+                this.supabase
+                    .from('notifications')
+                    .select(`
+                        *,
+                        actor:profiles!notifications_actor_id_fkey(id, first_name, last_name, avatar_url)
+                    `)
+                    .order('created_at', { ascending: false })
+                    .limit(50),
+                12000
+            );
+            if (error) throw error;
+
+            const notifications = Array.isArray(data) ? data : [];
+            this.notificationsCache = new Map(notifications.map((n) => [String(n.id), n]));
+
+            if (!notifications.length) {
+                content.innerHTML = `
+                    <div class="empty-state">
+                        <div class="empty-state-icon">🔔</div>
+                        <h3 class="empty-state-title">No notifications</h3>
+                        <p class="empty-state-text">Likes, comments, messages, and group updates show here.</p>
+                    </div>
+                `;
+                await this.refreshNotificationsBadge();
+                return;
+            }
+
+            content.innerHTML = `
+                <div class="notifications-actions">
+                    <button class="btn btn-outline btn-sm" type="button" onclick="App.markAllNotificationsRead()">Mark all read</button>
+                </div>
+                <div class="notifications-list">
+                    ${notifications.map((n) => {
+                        const actor = n.actor || {};
+                        const name = `${actor.first_name || ''} ${actor.last_name || ''}`.trim() || 'Someone';
+                        const avatarHtml = this.renderAvatarHtml(actor.avatar_url, actor.first_name, actor.last_name, name);
+                        const timeAgo = n.created_at ? this.formatTimeAgo(n.created_at) : '';
+                        const unreadClass = n.is_read ? '' : 'is-unread';
+                        const body = n.body ? `<div class="notification-body">${this.escapeHtml(n.body)}</div>` : '';
+                        return `
+                            <button class="notification-item ${unreadClass}" type="button" onclick="App.handleNotificationClick(${this.jsString(n.id)})">
+                                <div class="notification-avatar">${avatarHtml}</div>
+                                <div class="notification-main">
+                                    <div class="notification-title">${this.escapeHtml(n.title || 'Notification')}</div>
+                                    ${body}
+                                    <div class="notification-meta">${this.escapeHtml(name)}${timeAgo ? ` • ${this.escapeHtml(timeAgo)}` : ''}</div>
+                                </div>
+                            </button>
+                        `;
+                    }).join('')}
+                </div>
+            `;
+
+            await this.refreshNotificationsBadge();
+        } catch (error) {
+            console.error('Load notifications error:', error);
+            content.innerHTML = `
+                <div class="empty-state">
+                    <div class="empty-state-icon">⚠️</div>
+                    <h3 class="empty-state-title">Could not load notifications</h3>
+                    <p class="empty-state-text">Please try again in a moment.</p>
+                </div>
+            `;
+        }
+    }
+
+    async handleNotificationClick(notificationId) {
+        const id = String(notificationId || '');
+        if (!id) return;
+
+        const notification = this.notificationsCache?.get?.(id) || null;
+        if (!notification) {
+            await this.loadNotificationsIntoModal();
+            return;
+        }
+
+        if (!notification.is_read) {
+            try {
+                await this.supabase
+                    .from('notifications')
+                    .update({ is_read: true })
+                    .eq('id', id);
+            } catch (_) {}
+        }
+
+        await this.refreshNotificationsBadge();
+
+        const type = String(notification.type || '').trim();
+        const data = notification.data || {};
+
+        if (type === 'message' && data.chat_id) {
+            try {
+                const chat = await this.messagingManager.getChat(data.chat_id);
+                const me = this.authManager?.getUser?.()?.id || null;
+                const otherUserId = chat.user1_id === me ? chat.user2_id : chat.user1_id;
+                const other = otherUserId ? await this.postsManager.getFarmerProfileById(otherUserId) : null;
+                const name = other ? `${other.first_name || ''} ${other.last_name || ''}`.trim() || 'Chat' : 'Chat';
+                this.closeModal('notificationsModal');
+                await this.openChat(chat.id, name);
+                return;
+            } catch (_) {
+                this.closeModal('notificationsModal');
+                this.switchView('messages');
+                return;
+            }
+        }
+
+        if ((type === 'post_like' || type === 'post_comment') && data.post_id) {
+            this.closeModal('notificationsModal');
+            await this.openPostModal(data.post_id);
+            if (type === 'post_comment') {
+                await this.toggleComments(data.post_id);
+            }
+            return;
+        }
+
+        if ((type === 'group_join_request' || type === 'group_join_decision') && data.group_id) {
+            this.closeModal('notificationsModal');
+            this.switchView('groups');
+            if (type === 'group_join_request') {
+                await this.openJoinRequests(data.group_id);
+            }
+            return;
+        }
+
+        this.closeModal('notificationsModal');
+    }
+
+    async markAllNotificationsRead() {
+        if (!this.supabase || !this.authManager || !this.authManager.isAuthenticated()) return;
+        try {
+            await this.supabase
+                .from('notifications')
+                .update({ is_read: true })
+                .eq('is_read', false);
+        } catch (_) {}
+        await this.refreshNotificationsBadge();
+        await this.loadNotificationsIntoModal();
     }
 
     // Utility functions
     escapeHtml(text) {
         const div = document.createElement('div');
-        div.textContent = text;
+        div.textContent = String(text ?? '');
         return div.innerHTML;
     }
 
     jsString(value) {
         return JSON.stringify(String(value ?? ''));
+    }
+
+    safeUrl(url, options = {}) {
+        const value = String(url ?? '').trim();
+        if (!value) return '';
+
+        const allowDataImage = !!options.allowDataImage;
+        const allowBlob = !!options.allowBlob;
+
+        try {
+            const resolved = new URL(value, window.location.origin);
+            const protocol = String(resolved.protocol || '').toLowerCase();
+
+            if (protocol === 'http:' || protocol === 'https:') return resolved.href;
+            if (allowBlob && protocol === 'blob:') return resolved.href;
+            if (allowDataImage && protocol === 'data:') {
+                if (/^data:image\/(png|jpe?g|webp|gif);/i.test(value)) return value;
+            }
+
+            return '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    renderAvatarHtml(avatarUrl, firstName, lastName, altName) {
+        const initials = this.getInitials(firstName, lastName);
+        const safe = this.safeUrl(avatarUrl, { allowDataImage: true, allowBlob: true });
+        if (!safe) return this.escapeHtml(initials);
+        return `<img src="${safe}" alt="${this.escapeHtml(altName || 'Avatar')}" loading="lazy" decoding="async">`;
+    }
+
+    getSearchTypeTitle(type) {
+        const titles = {
+            'farmer': 'Farmers',
+            'farmer_crop': 'Farmers Growing',
+            'post_crop': 'Posts About',
+            'crop': 'Crops',
+            'market': 'Markets',
+            'post': 'Posts',
+            'group': 'Groups'
+        };
+        return titles[type] || type.charAt(0).toUpperCase() + type.slice(1) + 's';
+    }
+
+    renderSearchResultItem(item, type) {
+        switch (type) {
+            case 'farmer':
+            case 'farmer_crop':
+                const name = `${item.first_name || ''} ${item.last_name || ''}`.trim() || 'Farmer';
+                const avatarHtml = this.renderAvatarHtml(item.avatar_url, item.first_name, item.last_name, name);
+                const location = [item.district, item.province].filter(Boolean).join(', ');
+                const meta = [location, item.farmer_type].filter(Boolean).join(' • ');
+                return `
+                    <button class="navbar-search-item" type="button" data-user-id="${this.escapeHtml(item.id)}">
+                        <div class="navbar-search-item-avatar">${avatarHtml}</div>
+                        <div class="navbar-search-item-main">
+                            <div class="navbar-search-item-title">${this.escapeHtml(name)}</div>
+                            ${meta ? `<div class="navbar-search-item-meta">${this.escapeHtml(meta)}</div>` : ''}
+                        </div>
+                    </button>
+                `;
+
+            case 'post':
+            case 'post_crop':
+                const authorName = item.author ? `${item.author.first_name || ''} ${item.author.last_name || ''}`.trim() : 'Farmer';
+                const authorAvatar = this.renderAvatarHtml(item.author?.avatar_url, item.author?.first_name, item.author?.last_name, authorName);
+                const contentPreview = item.content ? this.escapeHtml(item.content.substring(0, 60) + (item.content.length > 60 ? '...' : '')) : '';
+                const postLocation = [item.location_district, item.location_province].filter(Boolean).join(', ');
+                return `
+                    <button class="navbar-search-item" type="button" data-post-id="${this.escapeHtml(item.id)}">
+                        <div class="navbar-search-item-avatar">${authorAvatar}</div>
+                        <div class="navbar-search-item-main">
+                            <div class="navbar-search-item-title">${authorName}</div>
+                            ${contentPreview ? `<div class="navbar-search-item-meta">${contentPreview}</div>` : ''}
+                            ${postLocation ? `<div class="navbar-search-item-meta">📍 ${this.escapeHtml(postLocation)}</div>` : ''}
+                        </div>
+                    </button>
+                `;
+
+            case 'market':
+                const marketName = item.name || 'Market';
+                const commodities = item.commodities ? this.escapeHtml(item.commodities.substring(0, 40) + (item.commodities.length > 40 ? '...' : '')) : '';
+                const marketLocation = [item.district, item.province].filter(Boolean).join(', ');
+                return `
+                    <button class="navbar-search-item" type="button" data-market-id="${this.escapeHtml(item.id)}">
+                        <div class="navbar-search-item-avatar">🏪</div>
+                        <div class="navbar-search-item-main">
+                            <div class="navbar-search-item-title">${this.escapeHtml(marketName)}</div>
+                            ${commodities ? `<div class="navbar-search-item-meta">${commodities}</div>` : ''}
+                            ${marketLocation ? `<div class="navbar-search-item-meta">📍 ${this.escapeHtml(marketLocation)}</div>` : ''}
+                        </div>
+                    </button>
+                `;
+
+            case 'group':
+                const groupName = item.name || 'Group';
+                const memberCount = item.member_count ? `${item.member_count} members` : '';
+                const groupType = item.group_type ? this.escapeHtml(item.group_type) : '';
+                return `
+                    <button class="navbar-search-item" type="button" data-group-id="${this.escapeHtml(item.id)}">
+                        <div class="navbar-search-item-avatar">👥</div>
+                        <div class="navbar-search-item-main">
+                            <div class="navbar-search-item-title">${this.escapeHtml(groupName)}</div>
+                            ${groupType ? `<div class="navbar-search-item-meta">${groupType}</div>` : ''}
+                            ${memberCount ? `<div class="navbar-search-item-meta">${memberCount}</div>` : ''}
+                        </div>
+                    </button>
+                `;
+
+            case 'crop':
+                const cropName = item.crops ? this.escapeHtml(item.crops.substring(0, 30) + (item.crops.length > 30 ? '...' : '')) : 'Crop';
+                const farmerLocation = [item.district, item.province].filter(Boolean).join(', ');
+                return `
+                    <button class="navbar-search-item" type="button" data-user-id="${this.escapeHtml(item.id)}">
+                        <div class="navbar-search-item-avatar">🌱</div>
+                        <div class="navbar-search-item-main">
+                            <div class="navbar-search-item-title">${cropName}</div>
+                            ${farmerLocation ? `<div class="navbar-search-item-meta">📍 ${this.escapeHtml(farmerLocation)}</div>` : ''}
+                            ${item.farm_size_ha ? `<div class="navbar-search-item-meta">${item.farm_size_ha} ha</div>` : ''}
+                        </div>
+                    </button>
+                `;
+
+            default:
+                return '';
+        }
     }
 
     debounce(fn, delayMs) {
@@ -2816,6 +4687,47 @@ class AppController {
         const first = (firstName || '').charAt(0).toUpperCase();
         const last = (lastName || '').charAt(0).toUpperCase();
         return (first + last) || 'U';
+    }
+
+    formatFileSize(size) {
+        const bytes = Number(size) || 0;
+        if (bytes < 1024) return `${bytes} B`;
+        const kb = bytes / 1024;
+        if (kb < 1024) return `${kb.toFixed(1)} KB`;
+        const mb = kb / 1024;
+        return `${mb.toFixed(1)} MB`;
+    }
+
+    renderMessageAttachments(attachments) {
+        const items = Array.isArray(attachments) ? attachments : [];
+        if (!items.length) return '';
+
+        const content = items.map((item) => {
+            const name = item?.file_name || 'Attachment';
+            const url = item?.file_url || '';
+            const type = item?.file_type || '';
+            const size = item?.file_size ? this.formatFileSize(item.file_size) : '';
+
+            if (type.startsWith('image/') && url) {
+                return `
+                    <a class="message-attachment message-attachment-image" href="${this.escapeHtml(url)}" target="_blank" rel="noopener">
+                        <img src="${this.escapeHtml(url)}" alt="${this.escapeHtml(name)}" loading="lazy" decoding="async">
+                        <span>${this.escapeHtml(name)}</span>
+                    </a>
+                `;
+            }
+
+            return `
+                <a class="message-attachment" href="${this.escapeHtml(url)}" target="_blank" rel="noopener">
+                    <div>
+                        <div class="message-attachment-name">${this.escapeHtml(name)}</div>
+                        ${size ? `<div class="message-attachment-size">${this.escapeHtml(size)}</div>` : ''}
+                    </div>
+                </a>
+            `;
+        }).join('');
+
+        return `<div class="message-attachments">${content}</div>`;
     }
 
     formatTimeAgo(timestamp) {

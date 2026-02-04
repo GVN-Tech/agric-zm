@@ -26,6 +26,9 @@
     <script src="js/market.js"></script>
     <script src="js/groups.js"></script>
     <script src="js/messaging.js"></script>
+    <script src="js/friends.js"></script>
+    <script src="js/stories.js"></script>
+    <script src="js/search.js"></script>
     <script src="js/app.js" defer></script>
     
     <!-- Register Service Worker -->
@@ -66,7 +69,8 @@
     <nav class="navbar">
         <div class="navbar-container">
             <div class="navbar-brand" onclick="if(window.App){App.navigate('feed');}">
-                🌾 Agrilovers
+                <img class="app-logo" src="assets/logo.jpg" alt="Agrilovers" width="76" height="76" decoding="async">
+                <span>Agrilovers</span>
             </div>
             <div class="navbar-search" id="navbarSearch" style="display: none;">
                 <input type="text" class="topbar-search" placeholder="Search farmers, crops, markets...">
@@ -103,6 +107,15 @@
                     </a>
                 </li>
                 <li class="navbar-item">
+                    <a href="#" class="navbar-link" id="notificationsNavBtn" onclick="if(window.App){App.openNotificationsModal(); return false;}" aria-label="Notifications">
+                        <div class="nav-icon nav-icon-with-badge">
+                            🔔
+                            <span class="nav-badge" id="notificationsBadge" style="display: none;"></span>
+                        </div>
+                        <span>Alerts</span>
+                    </a>
+                </li>
+                <li class="navbar-item">
                     <a href="?view=landing" class="navbar-link" id="accountNavBtn" onclick="if(window.App){App.handleAccountNav(event); return false;}" aria-label="Account">
                         <div class="nav-icon">👤</div>
                         <span>Me</span>
@@ -115,12 +128,24 @@
     <div id="landingView" class="view" style="display: none;">
         <div class="landing">
             <div class="landing-hero">
+                <div class="landing-hero-bg" id="landingCarousel" aria-hidden="true">
+                    <div class="landing-hero-bg-layer is-active"></div>
+                    <div class="landing-hero-bg-layer"></div>
+                </div>
                 <div class="landing-hero-inner">
                     <div class="landing-badge">Farmers Network • Zambia</div>
                     <h1 class="landing-title">Grow together. Sell smarter. Learn faster.</h1>
                     <p class="landing-subtitle">
                         Agrilovers connects farmers to share advice, report real market prices, and build trusted groups across Zambia.
                     </p>
+                    <div class="landing-hero-caption" id="landingHeroCaption" aria-live="polite">
+                        <div class="landing-hero-ticker">
+                            <div class="landing-hero-ticker-track">
+                                <span class="landing-hero-ticker-text">Better prices, together.</span>
+                                <span class="landing-hero-ticker-text" aria-hidden="true">Better prices, together.</span>
+                            </div>
+                        </div>
+                    </div>
                     <div class="landing-cta">
                         <button class="btn btn-primary btn-lg" onclick="if(window.App){App.openAccountModal();}">Get started</button>
                         <button class="btn btn-outline btn-lg" onclick="document.getElementById('landingFeatures')?.scrollIntoView({behavior:'smooth'});">See how it works</button>
@@ -131,41 +156,9 @@
                         <div class="landing-trust-item">🔒 Private by design</div>
                     </div>
                 </div>
-                <div class="landing-carousel" id="landingCarousel" aria-label="Farm photos">
-                    <div class="landing-carousel-track">
-                        <div class="landing-carousel-slide" data-caption="Fields, crops, and harvests across Zambia">
-                            <img src="https://picsum.photos/seed/agrilovers-field/1200/800" alt="Farm field and crops" decoding="async" fetchpriority="high">
-                        </div>
-                        <div class="landing-carousel-slide" data-caption="Meet farmers, share advice, and learn faster">
-                            <img src="https://picsum.photos/seed/agrilovers-farmer/1200/800" alt="Farmer working on the farm" loading="lazy" decoding="async">
-                        </div>
-                        <div class="landing-carousel-slide" data-caption="Market-ready produce and better pricing intelligence">
-                            <img src="https://picsum.photos/seed/agrilovers-produce/1200/800" alt="Fresh farm produce" loading="lazy" decoding="async">
-                        </div>
-                        <div class="landing-carousel-slide" data-caption="Livestock insights: cattle, goats, poultry, and more">
-                            <img src="https://picsum.photos/seed/agrilovers-livestock/1200/800" alt="Livestock on a farm" loading="lazy" decoding="async">
-                        </div>
-                        <div class="landing-carousel-slide" data-caption="A modern community built for real farms and real markets">
-                            <img src="https://picsum.photos/seed/agrilovers-maize/1200/800" alt="Maize crop on a farm" loading="lazy" decoding="async">
-                        </div>
-                    </div>
-                    <div class="landing-carousel-ui" aria-hidden="true">
-                        <div class="landing-carousel-pill">
-                            <div class="landing-carousel-pill-title">Agrilovers</div>
-                            <div class="landing-carousel-pill-caption" id="landingCarouselCaption">Fields, crops, and harvests across Zambia</div>
-                        </div>
-                    </div>
-                    <button class="landing-carousel-btn landing-carousel-prev" type="button" aria-label="Previous photo">‹</button>
-                    <button class="landing-carousel-btn landing-carousel-next" type="button" aria-label="Next photo">›</button>
-                    <div class="landing-carousel-dots" aria-label="Carousel navigation">
-                        <button class="landing-carousel-dot" type="button" aria-label="Photo 1"></button>
-                        <button class="landing-carousel-dot" type="button" aria-label="Photo 2"></button>
-                        <button class="landing-carousel-dot" type="button" aria-label="Photo 3"></button>
-                        <button class="landing-carousel-dot" type="button" aria-label="Photo 4"></button>
-                        <button class="landing-carousel-dot" type="button" aria-label="Photo 5"></button>
-                    </div>
-                </div>
             </div>
+
+            <div class="landing-photo-strip" id="landingPhotoStrip" aria-label="Farm photos"></div>
 
             <div class="landing-section" id="landingFeatures">
                 <h2 class="landing-section-title">Everything a farmer needs, in one place</h2>
@@ -205,7 +198,10 @@
 
             <div class="landing-footer">
                 <div class="landing-footer-inner">
-                    <div class="landing-footer-brand">🌾 Agrilovers</div>
+                    <div class="landing-footer-brand">
+                        <img class="app-logo" src="assets/logo.jpg" alt="Agrilovers" width="56" height="56" loading="lazy" decoding="async">
+                        <span>Agrilovers</span>
+                    </div>
                     <div class="landing-footer-text">A modern community platform built for farmers.</div>
                 </div>
             </div>
@@ -773,11 +769,11 @@
     </div>
 
     <!-- Auth Modal -->
-    <div id="authModal" class="modal">
+    <div id="authModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
         <div class="modal-content">
             <div class="modal-header">
                 <h3 class="modal-title" id="authModalTitle">Login</h3>
-                <button class="modal-close" onclick="App.closeModal('authModal')">&times;</button>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('authModal')">&times;</button>
             </div>
             
             <div id="authAlert" style="display: none;"></div>
@@ -871,11 +867,11 @@
     </div>
 
     <!-- Profile Creation Modal -->
-    <div id="profileModal" class="modal">
+    <div id="profileModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="profileModalTitle">
         <div class="modal-content">
             <div class="modal-header">
                 <h3 class="modal-title" id="profileModalTitle">Complete Your Profile</h3>
-                <button class="modal-close" id="profileModalClose" onclick="App.closeModal('profileModal')" style="display: none;">&times;</button>
+                <button class="modal-close" type="button" aria-label="Close" id="profileModalClose" onclick="App.closeModal('profileModal')" style="display: none;">&times;</button>
             </div>
             <form id="profileForm" onsubmit="App.handleProfileCreate(event); return false;">
                 <div class="form-group">
@@ -929,11 +925,11 @@
         </div>
     </div>
 
-    <div id="accountModal" class="modal">
+    <div id="accountModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="accountModalTitle">
         <div class="modal-content">
             <div class="modal-header">
-                <h3 class="modal-title">Account</h3>
-                <button class="modal-close" onclick="App.closeModal('accountModal')">&times;</button>
+                <h3 class="modal-title" id="accountModalTitle">Account</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('accountModal')">&times;</button>
             </div>
             <div class="card" style="margin-bottom: var(--spacing-md);">
                 <div style="display: flex; gap: var(--spacing-md); align-items: center;">
@@ -945,17 +941,18 @@
                 </div>
             </div>
             <div style="display: grid; gap: var(--spacing-sm);">
+                <button class="btn btn-outline" onclick="App.openConnectionsModal()">👥 My Connections</button>
                 <button class="btn btn-outline" onclick="App.openProfileEditModal()">Edit profile</button>
                 <button class="btn btn-primary" onclick="App.handleAccountSignOut()">Sign out</button>
             </div>
         </div>
     </div>
 
-    <div id="storyCreateModal" class="modal">
+    <div id="storyCreateModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="storyCreateModalTitle">
         <div class="modal-content">
             <div class="modal-header">
-                <h3 class="modal-title">Add Story</h3>
-                <button class="modal-close" onclick="App.closeModal('storyCreateModal')">&times;</button>
+                <h3 class="modal-title" id="storyCreateModalTitle">Add Story</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('storyCreateModal')">&times;</button>
             </div>
             <form id="storyCreateForm" onsubmit="App.handleStoryCreate(event); return false;">
                 <div class="form-group">
@@ -974,11 +971,11 @@
         </div>
     </div>
 
-    <div id="storyViewerModal" class="modal">
+    <div id="storyViewerModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="storyViewerTitle">
         <div class="modal-content">
             <div class="modal-header">
                 <h3 class="modal-title" id="storyViewerTitle">Story</h3>
-                <button class="modal-close" onclick="App.closeModal('storyViewerModal')">&times;</button>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('storyViewerModal')">&times;</button>
             </div>
             <div id="storyViewerMedia"></div>
             <div class="post-meta" id="storyViewerMeta"></div>
@@ -986,27 +983,32 @@
     </div>
 
     <!-- Chat Modal -->
-    <div id="chatModal" class="modal">
+    <div id="chatModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="chatTitle">
         <div class="modal-content modal-chat">
             <div class="modal-header">
                 <h3 class="modal-title" id="chatTitle">Chat</h3>
-                <button class="modal-close" onclick="App.closeModal('chatModal')">&times;</button>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('chatModal')">&times;</button>
             </div>
             <div id="chatMessages" class="chat-messages">
                 <!-- Messages will be inserted here -->
             </div>
+            <div id="chatAttachmentList" class="chat-attachment-list"></div>
             <form class="chat-composer" onsubmit="App.sendChatMessage(); return false;">
+                <label class="chat-attachment-btn" aria-label="Add attachment">
+                    📎
+                    <input type="file" id="chatAttachmentInput" multiple>
+                </label>
                 <input type="text" id="chatInput" class="form-input" placeholder="Type a message...">
                 <button class="btn btn-primary" type="submit">Send</button>
             </form>
         </div>
     </div>
 
-    <div id="farmerProfileModal" class="modal">
+    <div id="farmerProfileModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="farmerProfileModalTitle">
         <div class="modal-content">
             <div class="modal-header">
-                <h3 class="modal-title">Farmer Profile</h3>
-                <button class="modal-close" onclick="App.closeModal('farmerProfileModal')">&times;</button>
+                <h3 class="modal-title" id="farmerProfileModalTitle">Farmer Profile</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('farmerProfileModal')">&times;</button>
             </div>
             <div id="farmerProfileContent">
                 <div class="spinner"></div>
@@ -1015,11 +1017,11 @@
     </div>
 
     <!-- Create Group Modal -->
-    <div id="createGroupModal" class="modal">
+    <div id="createGroupModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="createGroupModalTitle">
         <div class="modal-content">
             <div class="modal-header">
-                <h3 class="modal-title">Create Group</h3>
-                <button class="modal-close" onclick="App.closeModal('createGroupModal')">&times;</button>
+                <h3 class="modal-title" id="createGroupModalTitle">Create Group</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('createGroupModal')">&times;</button>
             </div>
             <form id="createGroupForm" onsubmit="App.handleCreateGroup(event); return false;">
                 <div class="form-group">
@@ -1062,12 +1064,24 @@
         </div>
     </div>
 
+    <div id="joinRequestsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="joinRequestsModalTitle">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 class="modal-title" id="joinRequestsModalTitle">Join Requests</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('joinRequestsModal')">&times;</button>
+            </div>
+            <div id="joinRequestsContainer">
+                <div class="spinner"></div>
+            </div>
+        </div>
+    </div>
+
     <!-- Post Detail Modal -->
-    <div id="postModal" class="modal">
+    <div id="postModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="postModalTitle">
         <div class="modal-content" style="max-width: 600px;">
             <div class="modal-header">
-                <h3 class="modal-title">Post Details</h3>
-                <button class="modal-close" onclick="App.closeModal('postModal')">&times;</button>
+                <h3 class="modal-title" id="postModalTitle">Post Details</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('postModal')">&times;</button>
             </div>
             <div id="postModalContent">
                 <!-- Post content will be rendered here -->
@@ -1075,12 +1089,42 @@
         </div>
     </div>
 
+    <div id="notificationsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="notificationsModalTitle">
+        <div class="modal-content" style="max-width: 600px;">
+            <div class="modal-header">
+                <h3 class="modal-title" id="notificationsModalTitle">Notifications</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('notificationsModal')">&times;</button>
+            </div>
+            <div id="notificationsModalContent">
+                <div class="spinner"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Connections Modal -->
+    <div id="connectionsModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="connectionsModalTitle">
+        <div class="modal-content" style="max-width: 600px;">
+            <div class="modal-header">
+                <h3 class="modal-title" id="connectionsModalTitle">Connections</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('connectionsModal')">&times;</button>
+            </div>
+            <div class="tabs">
+                <button class="tab-btn active" onclick="App.switchConnectionsTab('friends')">Friends</button>
+                <button class="tab-btn" onclick="App.switchConnectionsTab('requests')">Requests</button>
+                <button class="tab-btn" onclick="App.switchConnectionsTab('suggestions')">Suggestions</button>
+            </div>
+            <div id="connectionsContent" class="modal-body" style="padding-top: var(--spacing-md);">
+                <div class="spinner"></div>
+            </div>
+        </div>
+    </div>
+
     <!-- Calculator Modal -->
-    <div id="calculatorModal" class="modal">
+    <div id="calculatorModal" class="modal" role="dialog" aria-modal="true" aria-labelledby="calculatorModalTitle">
         <div class="modal-content">
             <div class="modal-header">
-                <h3 class="modal-title">🌾 Farm Calculator</h3>
-                <button class="modal-close" onclick="App.closeModal('calculatorModal')">&times;</button>
+                <h3 class="modal-title" id="calculatorModalTitle">🌾 Farm Calculator</h3>
+                <button class="modal-close" type="button" aria-label="Close" onclick="App.closeModal('calculatorModal')">&times;</button>
             </div>
             <div class="form-group">
                 <label class="form-label">Calculator Type</label>
@@ -1111,7 +1155,7 @@
     </div>
 
     <!-- Loading Overlay -->
-    <div id="loadingOverlay" class="modal" style="display: flex;">
+    <div id="loadingOverlay" class="modal" role="status" aria-live="polite" aria-label="Loading" style="display: flex;">
         <div class="spinner"></div>
     </div>
 </body>

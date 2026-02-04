@@ -49,7 +49,7 @@ class GroupsManager {
             groupType = null,
             cropTag = null,
             province = null,
-            isPublic = true,
+            isPublic = null,
             limit = 50,
             offset = 0
         } = options;
@@ -96,6 +96,8 @@ class GroupsManager {
             members_count: row.members_count,
             user_role: row.user_role,
             is_member: !!row.user_role,
+            join_request_status: row.join_request_status || null,
+            join_request_id: row.join_request_id || null,
             creator: {
                 id: row.created_by,
                 first_name: row.creator_first_name,
@@ -111,7 +113,7 @@ class GroupsManager {
             groupType = null,
             cropTag = null,
             province = null,
-            isPublic = true,
+            isPublic = null,
             limit = 50,
             offset = 0
         } = options;
@@ -153,20 +155,39 @@ class GroupsManager {
         });
 
         const membershipMap = new Map();
+        const joinRequestMap = new Map();
         if (userRes.data?.user) {
-            const { data: memberships } = await this.supabase
-                .from('group_members')
-                .select('group_id, role')
-                .eq('user_id', userRes.data.user.id)
-                .in('group_id', groupIds);
+            const userId = userRes.data.user.id;
+            const [membershipsRes, joinRequestsRes] = await Promise.all([
+                this.supabase
+                    .from('group_members')
+                    .select('group_id, role')
+                    .eq('user_id', userId)
+                    .in('group_id', groupIds),
+                this.supabase
+                    .from('group_join_requests')
+                    .select('id, group_id, status')
+                    .eq('user_id', userId)
+                    .in('group_id', groupIds)
+            ]);
 
-            memberships?.forEach(m => membershipMap.set(m.group_id, m.role));
+            if (membershipsRes.error) throw membershipsRes.error;
+            membershipsRes.data?.forEach(m => membershipMap.set(m.group_id, m.role));
+
+            if (joinRequestsRes.error) {
+                if (joinRequestsRes.error.code !== '42P01') throw joinRequestsRes.error;
+            } else {
+                joinRequestsRes.data?.forEach(r => joinRequestMap.set(r.group_id, { id: r.id, status: r.status }));
+            }
         }
 
         data.forEach(group => {
             group.user_role = membershipMap.get(group.id) || null;
             group.is_member = !!group.user_role;
             group.members_count = memberCountMap.get(group.id) || 0;
+            const request = joinRequestMap.get(group.id) || null;
+            group.join_request_status = request?.status || null;
+            group.join_request_id = request?.id || null;
         });
 
         return data;
@@ -215,6 +236,18 @@ class GroupsManager {
         const { data: { user } } = await this.supabase.auth.getUser();
         if (!user) throw new Error('User must be authenticated');
 
+        const { data: group, error: groupError } = await this.supabase
+            .from('groups')
+            .select('id, is_public')
+            .eq('id', groupId)
+            .single();
+
+        if (groupError) throw groupError;
+
+        if (group && group.is_public === false) {
+            return this.requestJoinGroup(groupId);
+        }
+
         const { data, error } = await this.supabase
             .from('group_members')
             .insert({
@@ -234,6 +267,185 @@ class GroupsManager {
         }
 
         return data;
+    }
+
+    async requestJoinGroup(groupId) {
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const payload = {
+            group_id: groupId,
+            user_id: user.id,
+            status: 'pending',
+            requested_at: new Date().toISOString(),
+            decided_at: null,
+            decided_by: null
+        };
+
+        const { data, error } = await this.supabase
+            .from('group_join_requests')
+            .insert(payload)
+            .select('id, status, requested_at')
+            .single();
+
+        if (error) {
+            if (error.code === '42P01') {
+                const { data: membership, error: membershipError } = await this.supabase
+                    .from('group_members')
+                    .insert({
+                        group_id: groupId,
+                        user_id: user.id,
+                        role: 'member'
+                    })
+                    .select()
+                    .single();
+
+                if (membershipError) {
+                    if (membershipError.code === '23505') return { success: true, alreadyMember: true };
+                    throw membershipError;
+                }
+
+                return { success: true, joinedDirectly: true, membership };
+            }
+            if (error.code === '23505') {
+                const { data: existing, error: existingError } = await this.supabase
+                    .from('group_join_requests')
+                    .select('id, status')
+                    .eq('group_id', groupId)
+                    .eq('user_id', user.id)
+                    .single();
+
+                if (existingError) throw existingError;
+
+                if (existing?.status === 'rejected') {
+                    const { data: retry, error: retryError } = await this.supabase
+                        .from('group_join_requests')
+                        .update({
+                            status: 'pending',
+                            requested_at: new Date().toISOString(),
+                            decided_at: null,
+                            decided_by: null
+                        })
+                        .eq('id', existing.id)
+                        .select('id, status, requested_at')
+                        .single();
+
+                    if (retryError) throw retryError;
+
+                    return {
+                        success: true,
+                        requested: true,
+                        join_request_status: retry?.status || 'pending',
+                        join_request_id: retry?.id || existing.id
+                    };
+                }
+
+                return {
+                    success: true,
+                    requested: existing?.status === 'pending',
+                    alreadyApproved: existing?.status === 'approved',
+                    rejected: existing?.status === 'rejected',
+                    join_request_status: existing?.status || null,
+                    join_request_id: existing?.id || null
+                };
+            }
+            throw error;
+        }
+
+        return {
+            success: true,
+            requested: true,
+            join_request_status: data?.status || 'pending',
+            join_request_id: data?.id || null
+        };
+    }
+
+    async getPendingJoinRequests(groupId) {
+        const { data, error } = await this.supabase
+            .from('group_join_requests')
+            .select(`
+                id,
+                group_id,
+                user_id,
+                status,
+                requested_at,
+                user:profiles!group_join_requests_user_id_fkey(
+                    id,
+                    first_name,
+                    last_name,
+                    avatar_url,
+                    province,
+                    district
+                )
+            `)
+            .eq('group_id', groupId)
+            .eq('status', 'pending')
+            .order('requested_at', { ascending: true });
+
+        if (error) throw error;
+        return data || [];
+    }
+
+    async approveJoinRequest(requestId, groupId, userId) {
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const now = new Date().toISOString();
+        const { error: memberError } = await this.supabase
+            .from('group_members')
+            .insert({
+                group_id: groupId,
+                user_id: userId,
+                role: 'member'
+            });
+
+        if (memberError && memberError.code !== '23505') throw memberError;
+
+        const { error: requestError } = await this.supabase
+            .from('group_join_requests')
+            .update({
+                status: 'approved',
+                decided_by: user.id,
+                decided_at: now
+            })
+            .eq('id', requestId);
+
+        if (requestError) throw requestError;
+
+        return { success: true };
+    }
+
+    async rejectJoinRequest(requestId) {
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const now = new Date().toISOString();
+        const { error } = await this.supabase
+            .from('group_join_requests')
+            .update({
+                status: 'rejected',
+                decided_by: user.id,
+                decided_at: now
+            })
+            .eq('id', requestId);
+
+        if (error) throw error;
+        return { success: true };
+    }
+
+    async cancelJoinRequest(groupId) {
+        const { data: { user } } = await this.supabase.auth.getUser();
+        if (!user) throw new Error('User must be authenticated');
+
+        const { error } = await this.supabase
+            .from('group_join_requests')
+            .delete()
+            .eq('group_id', groupId)
+            .eq('user_id', user.id)
+            .eq('status', 'pending');
+
+        if (error) throw error;
+        return { success: true };
     }
 
     // Leave a group

@@ -40,7 +40,7 @@ class Toast {
             
             .toast-icon { font-size: 18px; }
             .toast-message { flex: 1; }
-            .toast-close { cursor: pointer; opacity: 0.7; font-size: 18px; }
+            .toast-close { cursor: pointer; opacity: 0.7; font-size: 18px; background: none; border: 0; color: inherit; padding: 0; line-height: 1; }
             .toast-close:hover { opacity: 1; }
             
             @keyframes slideUp {
@@ -58,7 +58,7 @@ class Toast {
     show(message, type = 'info', duration = 4000) {
         const toast = document.createElement('div');
         toast.className = `toast ${type}`;
-        
+
         const icons = {
             success: '✅',
             error: '❌',
@@ -66,11 +66,24 @@ class Toast {
             info: 'ℹ️'
         };
 
-        toast.innerHTML = `
-            <span class="toast-icon">${icons[type]}</span>
-            <span class="toast-message">${message}</span>
-            <span class="toast-close" onclick="this.parentElement.remove()">×</span>
-        `;
+        const iconEl = document.createElement('span');
+        iconEl.className = 'toast-icon';
+        iconEl.textContent = icons[type] || icons.info;
+
+        const messageEl = document.createElement('span');
+        messageEl.className = 'toast-message';
+        messageEl.textContent = String(message ?? '');
+
+        const closeEl = document.createElement('button');
+        closeEl.type = 'button';
+        closeEl.className = 'toast-close';
+        closeEl.setAttribute('aria-label', 'Close notification');
+        closeEl.textContent = '×';
+        closeEl.addEventListener('click', () => toast.remove());
+
+        toast.appendChild(iconEl);
+        toast.appendChild(messageEl);
+        toast.appendChild(closeEl);
 
         this.container.appendChild(toast);
 
